@@ -12,6 +12,18 @@ namespace GL = VoxelGame::GL;
 
 export namespace VoxelGame::Shader {
     
+    // Структура для кешування локацій шейдера
+    struct ShaderProgram {
+        GLuint id;
+        
+        // Uniform Locations
+        GLint loc_model;
+        GLint loc_view;
+        GLint loc_proj;
+        GLint loc_textureArray;
+        GLint loc_showGrid;
+    };
+
     std::string LoadFile(const std::string& path) {
         std::ifstream file(path);
         if (!file.is_open()) return "";
@@ -35,18 +47,28 @@ export namespace VoxelGame::Shader {
         return sh;
     }
 
-    GLuint CreateProgram(const std::string& vertPath, const std::string& fragPath) {
+    // Оновлена функція повертає структуру з кешованими локаціями
+    ShaderProgram CreateProgram(const std::string& vertPath, const std::string& fragPath) {
         std::string vCode = LoadFile(vertPath);
         std::string fCode = LoadFile(fragPath);
         
-        GLuint prog = GL::glCreateProgram();
+        GLuint progID = GL::glCreateProgram();
         GLuint vs = CreateShader(vCode, GL_VERTEX_SHADER);
         GLuint fs = CreateShader(fCode, GL_FRAGMENT_SHADER);
         
-        GL::glAttachShader(prog, vs);
-        GL::glAttachShader(prog, fs);
-        GL::glLinkProgram(prog);
+        GL::glAttachShader(progID, vs);
+        GL::glAttachShader(progID, fs);
+        GL::glLinkProgram(progID);
         
+        // Кешування локацій
+        ShaderProgram prog;
+        prog.id = progID;
+        prog.loc_model = GL::glGetUniformLocation(progID, "u_model");
+        prog.loc_view = GL::glGetUniformLocation(progID, "u_view");
+        prog.loc_proj = GL::glGetUniformLocation(progID, "u_proj");
+        prog.loc_textureArray = GL::glGetUniformLocation(progID, "u_textureArray");
+        prog.loc_showGrid = GL::glGetUniformLocation(progID, "u_showGrid");
+
         return prog;
     }
 }

@@ -4,6 +4,10 @@
 #include <iostream>
 #include <ctime>
 #include <cmath>
+#include <chrono> // Для профайлера
+#include <string>
+#include <iomanip>
+#include <sstream>
 
 import VoxelGame.Types;
 import VoxelGame.Math;
@@ -64,6 +68,20 @@ GLuint CreatePaletteTextureArray() {
     return texID;
 }
 
+// Простий клас таймера
+struct Profiler {
+    using Clock = std::chrono::high_resolution_clock;
+    std::chrono::time_point<Clock> start;
+    
+    void begin() { start = Clock::now(); }
+    
+    double end() { // Повертає мс
+        auto now = Clock::now();
+        std::chrono::duration<double, std::milli> diff = now - start;
+        return diff.count();
+    }
+};
+
 int main(int argc, char* argv[]) {
     SDL_Init(SDL_INIT_VIDEO);
     
@@ -71,8 +89,10 @@ int main(int argc, char* argv[]) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 
-    SDL_Window* window = SDL_CreateWindow("Voxel Game - Texture Arrays & Debug Grid", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    SDL_Window* window = SDL_CreateWindow("Voxel Game", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     SDL_GLContext context = SDL_GL_CreateContext(window);
+    // Вимикаємо V-Sync для тестування максимального FPS
+    SDL_GL_SetSwapInterval(0); 
     
     GL::LoadFunctions();
     
@@ -84,6 +104,7 @@ int main(int argc, char* argv[]) {
     WorldManager world;
     int seed = std::time(nullptr) % 1000;
     
+    // --- Початкова генерація ---
     for (int cx = -1; cx <= 1; ++cx) {
         for (int cz = -1; cz <= 1; ++cz) {
             VoxelChunk& chunk = world.createChunk(cx, cz);
@@ -132,7 +153,6 @@ int main(int argc, char* argv[]) {
     GL::glBindBuffer(GL_ARRAY_BUFFER, VBO);
     GL::glBufferData(GL_ARRAY_BUFFER, allVertices.size() * sizeof(PackedVertex), allVertices.data(), GL_STATIC_DRAW);
 
-    // [FIX] Updated Vertex Layout (Stride = 12 bytes)
     GLsizei stride = sizeof(PackedVertex); // 12 bytes
     
     // Loc 0: PackedPos (uint) -> Offset 0
@@ -143,24 +163,38 @@ int main(int argc, char* argv[]) {
     GL::glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, stride, (void*)(sizeof(uint32_t)));
     GL::glEnableVertexAttribArray(1);
 
-    // [FIX] Loc 2: PackedUV (uint) -> Offset 8
+    // Loc 2: PackedUV (uint) -> Offset 8
     GL::glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, stride, (void*)(2 * sizeof(uint32_t)));
     GL::glEnableVertexAttribArray(2);
 
-    GLuint prog = CreateProgram("src/shaders/voxel.vert.glsl", "src/shaders/voxel.frag.glsl");
-    GL::glUseProgram(prog);
+    // Тепер це структура ShaderProgram
+    ShaderProgram shader = CreateProgram("src/shaders/voxel.vert.glsl", "src/shaders/voxel.frag.glsl");
+    GL::glUseProgram(shader.id);
 
     GLuint texArrayID = CreatePaletteTextureArray();
     glActiveTexture(GL_TEXTURE0);
     GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texArrayID);
-    GL::glUniform1i(GL::glGetUniformLocation(prog, "u_textureArray"), 0);
+    // Використовуємо кешовану локацію
+    GL::glUniform1i(shader.loc_textureArray, 0);
 
     float camX = 16.0f, camY = 40.0f, camZ = 60.0f;
     float yaw = -90.0f, pitch = -30.0f;
-    bool showGrid = false; // Default: Grid OFF
+    bool showGrid = false; 
+
+    // --- Profiler Variables ---
+    Profiler frameTimer, logicTimer, renderTimer;
+    double logicTimeMs = 0.0;
+    double renderTimeMs = 0.0;
+    double totalFrameTimeMs = 0.0;
+    int frameCount = 0;
+    double timeAccumulator = 0.0; // Для оновлення заголовка раз на 1с
 
     bool running = true;
     while(running) {
+        frameTimer.begin(); // START FRAME
+
+        // --- 1. Input & Logic ---
+        logicTimer.begin();
         SDL_Event ev;
         while(SDL_PollEvent(&ev)) {
             if(ev.type == SDL_EVENT_QUIT) running = false;
@@ -170,9 +204,13 @@ int main(int argc, char* argv[]) {
                     mouseCaptured = false;
                     SDL_SetWindowRelativeMouseMode(window, false);
                 }
-                if (ev.key.key == SDLK_G) { // Grid Toggle
+                if (ev.key.key == SDLK_G) { 
                     showGrid = !showGrid;
-                    std::cout << "Grid: " << (showGrid ? "ON" : "OFF") << std::endl;
+                }
+                // Regenerate on R (Demo logic overhead)
+                if (ev.key.key == SDLK_R) {
+                    // Simple rebuild logic (can be slow, but useful to profile)
+                    // ... (re-generate code omitted for brevity as it's static in loop for now) ...
                 }
             }
             if(ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !mouseCaptured) {
@@ -194,13 +232,18 @@ int main(int argc, char* argv[]) {
         Vec3 right = Normalize(Cross(front, {0,1,0}));
 
         const bool* keys = SDL_GetKeyboardState(nullptr);
-        float speed = 0.5f;
+        float speed = 0.5f; // Per frame speed (should use delta time)
         if(keys[SDL_SCANCODE_LSHIFT]) speed = 1.5f;
         if(keys[SDL_SCANCODE_W]) { camX += front.x*speed; camY += front.y*speed; camZ += front.z*speed; }
         if(keys[SDL_SCANCODE_S]) { camX -= front.x*speed; camY -= front.y*speed; camZ -= front.z*speed; }
         if(keys[SDL_SCANCODE_A]) { camX -= right.x*speed; camY -= right.y*speed; camZ -= right.z*speed; }
         if(keys[SDL_SCANCODE_D]) { camX += right.x*speed; camY += right.y*speed; camZ += right.z*speed; }
+        
+        logicTimeMs = logicTimer.end();
 
+        // --- 2. Render ---
+        renderTimer.begin();
+        
         int w, h; 
         SDL_GetWindowSizeInPixels(window, &w, &h);
         glViewport(0,0,w,h);
@@ -217,11 +260,11 @@ int main(int argc, char* argv[]) {
         Mat4 view = LookAt({camX, camY, camZ}, {camX+front.x, camY+front.y, camZ+front.z}, {0,1,0});
         Mat4 proj = Perspective(1.047f, (float)w/h, 0.1f, 1000.0f); 
 
-        GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_model"), 1, GL_FALSE, model.m);
-        GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_view"), 1, GL_FALSE, view.m);
-        GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_proj"), 1, GL_FALSE, proj.m);
-        // [FIX] Pass grid toggle uniform
-        GL::glUniform1i(GL::glGetUniformLocation(prog, "u_showGrid"), showGrid ? 1 : 0);
+        // Використовуємо кешовані локації
+        GL::glUniformMatrix4fv(shader.loc_model, 1, GL_FALSE, model.m);
+        GL::glUniformMatrix4fv(shader.loc_view, 1, GL_FALSE, view.m);
+        GL::glUniformMatrix4fv(shader.loc_proj, 1, GL_FALSE, proj.m);
+        GL::glUniform1i(shader.loc_showGrid, showGrid ? 1 : 0);
 
         GL::glBindVertexArray(VAO);
         glActiveTexture(GL_TEXTURE0);
@@ -232,12 +275,36 @@ int main(int argc, char* argv[]) {
             chunkModel.m[12] = cmd.wx;
             chunkModel.m[13] = 0;
             chunkModel.m[14] = cmd.wz;
-            GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_model"), 1, GL_FALSE, chunkModel.m);
+            GL::glUniformMatrix4fv(shader.loc_model, 1, GL_FALSE, chunkModel.m);
             
             glDrawArrays(GL_TRIANGLES, cmd.start, cmd.count);
         }
 
-        SDL_GL_SwapWindow(window);
+        SDL_GL_SwapWindow(window); // SwapBuffers is part of render/present time
+        renderTimeMs = renderTimer.end();
+
+        totalFrameTimeMs = frameTimer.end(); // END FRAME
+
+        // --- 3. Profiler Title Update (Every ~500ms) ---
+        timeAccumulator += totalFrameTimeMs;
+        frameCount++;
+        
+        if (timeAccumulator >= 500.0) {
+            double avgFrameTime = timeAccumulator / frameCount;
+            double fps = 1000.0 / avgFrameTime;
+            
+            std::stringstream ss;
+            ss << "Voxel Engine | "
+               << std::fixed << std::setprecision(1) << fps << " FPS | "
+               << std::setprecision(2) << avgFrameTime << "ms (Total) | "
+               << "Logic: " << logicTimeMs << "ms | "
+               << "Render: " << renderTimeMs << "ms";
+               
+            SDL_SetWindowTitle(window, ss.str().c_str());
+            
+            timeAccumulator = 0.0;
+            frameCount = 0;
+        }
     }
     return 0;
 }
