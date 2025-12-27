@@ -48,6 +48,8 @@ target_sources(VoxelGame
             src/modules/Shader.cppm
             src/modules/World.cppm
             src/modules/Meshing.cppm
+            src/modules/Utils.cppm
+            src/modules/RenderUtils.cppm
 )
 
 target_include_directories(VoxelGame

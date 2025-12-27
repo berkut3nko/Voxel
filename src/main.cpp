@@ -8,6 +8,7 @@
 #include <string>
 #include <iomanip>
 #include <sstream>
+#include <algorithm> 
 
 import VoxelGame.Types;
 import VoxelGame.Math;
@@ -15,207 +16,181 @@ import VoxelGame.GL;
 import VoxelGame.Shader;
 import VoxelGame.World;
 import VoxelGame.Meshing;
+import VoxelGame.Utils;
+import VoxelGame.RenderUtils;
 
 using namespace VoxelGame::Types;
 using namespace VoxelGame::Math;
 using namespace VoxelGame::World;
 using namespace VoxelGame::Meshing;
 using namespace VoxelGame::Shader;
+using namespace VoxelGame::Utils;
+using namespace VoxelGame::RenderUtils;
 
 namespace GL = VoxelGame::GL;
 
-struct ChunkRenderData {
+#ifndef GL_ANY_SAMPLES_PASSED_CONSERVATIVE
+#define GL_ANY_SAMPLES_PASSED_CONSERVATIVE 0x8D6A
+#endif
+
+// Розширена структура даних чанка
+struct ChunkRenderDataExtended {
     std::vector<GpuQuad> gpuQuads;
     int chunkX, chunkZ;
-};
-
-struct GpuChunkInfo {
-    int x, z;
-    unsigned int quadStart;
-    int pad;
-};
-
-// --- Palette Generation Helper ---
-GLuint CreatePaletteTextureArray() {
-    GLuint texID;
-    GL::glGenTextures(1, &texID);
-    GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texID);
-    int w=16, h=16, l=8;
-    GL::glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGB8, w, h, l, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-    auto Fill = [&](int la, uint8_t r, uint8_t g, uint8_t b) {
-        std::vector<uint8_t> d(w*h*3);
-        for(int i=0; i<w*h; ++i) { 
-            uint8_t n = rand()%40; 
-            d[i*3]=r>n?r-n:0; d[i*3+1]=g>n?g-n:0; d[i*3+2]=b>n?b-n:0; 
-        }
-        GL::glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, la, w, h, 1, GL_RGB, GL_UNSIGNED_BYTE, d.data());
-    };
-    Fill(0,50,200,50); Fill(1,139,69,19); Fill(2,240,240,255); Fill(3,50,50,50);
-    Fill(4,100,100,255); Fill(5,200,80,80); Fill(6,128,128,128);
-    GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    return texID;
-}
-
-// Виправлений профайлер з високою точністю
-struct Profiler {
-    using Clock = std::chrono::high_resolution_clock;
-    std::chrono::time_point<Clock> start;
-    void begin() { start = Clock::now(); }
-    double end() { 
-        auto dur = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
-        return dur.count() / 1000.0; 
-    }
+    unsigned int globalBufferOffset; 
+    
+    GLuint queryID;
+    bool visible;     
+    bool waitingForQuery; 
+    bool wasInFrustum; // Для відстеження входу/виходу
 };
 
 int main(int argc, char* argv[]) {
-    SDL_Init(SDL_INIT_VIDEO);
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) return -1;
     
-    // OpenGL 4.5
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    
-    SDL_Window* window = SDL_CreateWindow("Voxel Game - MultiDrawElements", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+
+    SDL_Window* window = SDL_CreateWindow("Voxel Game - Final Optimization", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    if (!window) return -1;
+
     SDL_GLContext context = SDL_GL_CreateContext(window);
+    if (!context) return -1;
     
-    // VSync OFF для тесту продуктивності
-    SDL_GL_SetSwapInterval(0);
+    SDL_GL_MakeCurrent(window, context);
+    SDL_GL_SetSwapInterval(0); 
     
-    GL::LoadFunctions();
+    GL::LoadFunctions(); 
+
+    bool occlusionSupported = (GL::glGenQueries != nullptr && GL::glBeginQuery != nullptr);
+    if (!occlusionSupported) std::cerr << "WARNING: Occlusion Queries not supported." << std::endl;
     
     bool mouseCaptured = true;
     SDL_SetWindowRelativeMouseMode(window, true);
 
     WorldManager world;
     int seed = std::time(nullptr) % 1000;
-    int range = 1;
+    int range = 6; 
+    size_t estChunks = (range * 2 + 1) * (range * 2 + 1);
+
+    // --- Batch Query Generation ---
+    std::vector<GLuint> queryPool;
+    if (occlusionSupported) {
+        queryPool.resize(estChunks + 50); 
+        GL::glGenQueries((GLsizei)queryPool.size(), queryPool.data());
+    }
+    size_t queryPoolIdx = 0;
     
-    std::cout << "Generating chunks..." << std::endl;
+    std::cout << "Generating chunks (Range: " << range << ")..." << std::endl;
     for (int cx = -range; cx <= range; ++cx) {
         for (int cz = -range; cz <= range; ++cz) {
-            VoxelChunk& chunk = world.createChunk(cx, cz);
-            TerrainSystem::Generate(chunk, seed);
+            TerrainSystem::Generate(world.createChunk(cx, cz), seed);
         }
     }
 
     std::cout << "Meshing chunks..." << std::endl;
-    std::vector<ChunkRenderData> renderChunks;
+    std::vector<ChunkRenderDataExtended> renderChunks;
+    std::vector<GpuQuad> allGpuQuads;
+
+    renderChunks.reserve(estChunks);
+    allGpuQuads.reserve(estChunks * 2000); 
+
     for (int cx = -range; cx <= range; ++cx) {
         for (int cz = -range; cz <= range; ++cz) {
             VoxelChunk* chunk = world.getChunk(cx, cz);
             if(!chunk) continue;
+            
             MeshingContext ctx;
             ctx.center = chunk;
             ctx.neighbors[0] = world.getChunk(cx + 1, cz);
             ctx.neighbors[1] = world.getChunk(cx - 1, cz);
-            ctx.neighbors[2] = nullptr;
-            ctx.neighbors[3] = nullptr;
             ctx.neighbors[4] = world.getChunk(cx, cz + 1);
             ctx.neighbors[5] = world.getChunk(cx, cz - 1);
 
             std::vector<Quad> quads = GenerateQuads(ctx);
             std::vector<GpuQuad> gpuQ = BuildSSBOData(quads);
-            if(!gpuQ.empty()) renderChunks.push_back({gpuQ, cx, cz});
+            
+            if(!gpuQ.empty()) {
+                unsigned int offset = (unsigned int)allGpuQuads.size();
+                allGpuQuads.insert(allGpuQuads.end(), gpuQ.begin(), gpuQ.end());
+                
+                GLuint qID = 0;
+                if (occlusionSupported && queryPoolIdx < queryPool.size()) {
+                    qID = queryPool[queryPoolIdx++];
+                }
+                
+                // visible = true, wasInFrustum = false
+                renderChunks.push_back({std::move(gpuQ), cx, cz, offset, qID, true, false, false});
+            }
         }
     }
-    
-    if (renderChunks.empty()) {
-        std::cerr << "WARNING: No geometry generated!" << std::endl;
-    }
 
-    std::vector<GpuQuad> allGpuQuads;
-    std::vector<GL::DrawElementsIndirectCommand> commands;
-    std::vector<GpuChunkInfo> chunkInfos;
-
-    for(size_t i=0; i<renderChunks.size(); ++i) {
-        const auto& rc = renderChunks[i];
-        
-        GL::DrawElementsIndirectCommand cmd;
-        cmd.count = 6; 
-        cmd.instanceCount = rc.gpuQuads.size(); 
-        cmd.firstIndex = 0;
-        cmd.baseVertex = 0;
-        cmd.baseInstance = i; 
-        
-        commands.push_back(cmd);
-        
-        chunkInfos.push_back({
-            rc.chunkX * CHUNK_SIZE, 
-            rc.chunkZ * CHUNK_SIZE, 
-            (unsigned int)allGpuQuads.size(), 
-            0
-        });
-
-        allGpuQuads.insert(allGpuQuads.end(), rc.gpuQuads.begin(), rc.gpuQuads.end());
-    }
-
-    // 1. VAO & IBO setup
     GLuint emptyVAO;
     GL::glGenVertexArrays(1, &emptyVAO);
-    GL::glBindVertexArray(emptyVAO); // Bind VAO first!
+    GL::glBindVertexArray(emptyVAO);
 
-    // Create Static IBO (0,1,2, 0,2,3)
     GLuint indices[] = {0, 1, 2, 0, 2, 3};
     GLuint ibo;
     GL::glGenBuffers(1, &ibo);
-    GL::glBindBuffer(0x8893, ibo); // GL_ELEMENT_ARRAY_BUFFER to CURRENT VAO
+    GL::glBindBuffer(0x8893, ibo); 
     GL::glBufferData(0x8893, sizeof(indices), indices, GL_STATIC_DRAW);
-    
-    // Unbind VAO to prevents accidental modification
     GL::glBindVertexArray(0);
 
-    // 2. SSBO Buffers
     GLuint ssboQuads, ssboChunks, indirectBuffer;
     GL::glGenBuffers(1, &ssboQuads);
-    GL::glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboQuads);
-    GL::glBufferData(GL_SHADER_STORAGE_BUFFER, allGpuQuads.size() * sizeof(GpuQuad), allGpuQuads.data(), GL_STATIC_DRAW);
-    GL::glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboQuads);
+    GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboQuads);
+    GL::glBufferData(GL::SHADER_STORAGE_BUFFER, allGpuQuads.size() * sizeof(GpuQuad), allGpuQuads.data(), GL_STATIC_DRAW);
+    GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 0, ssboQuads);
 
     GL::glGenBuffers(1, &ssboChunks);
-    GL::glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboChunks);
-    GL::glBufferData(GL_SHADER_STORAGE_BUFFER, chunkInfos.size() * sizeof(GpuChunkInfo), chunkInfos.data(), GL_STATIC_DRAW);
-    GL::glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboChunks);
+    GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboChunks);
+    GL::glBufferData(GL::SHADER_STORAGE_BUFFER, renderChunks.size() * sizeof(GpuChunkInfo), nullptr, GL_DYNAMIC_DRAW);
+    GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 1, ssboChunks);
 
     GL::glGenBuffers(1, &indirectBuffer);
-    GL::glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirectBuffer);
-    GL::glBufferData(GL_DRAW_INDIRECT_BUFFER, commands.size() * sizeof(GL::DrawElementsIndirectCommand), commands.data(), GL_STATIC_DRAW);
+    GL::glBindBuffer(GL::DRAW_INDIRECT_BUFFER, indirectBuffer);
+    GL::glBufferData(GL::DRAW_INDIRECT_BUFFER, renderChunks.size() * sizeof(GL::DrawElementsIndirectCommand), nullptr, GL_DYNAMIC_DRAW);
 
     ShaderProgram shader = CreateProgram("src/shaders/voxel.vert.glsl", "src/shaders/voxel.frag.glsl");
-    
-    // !!! CRITICAL CHECK !!!
-    if (shader.id == 0) {
-        std::cerr << "FATAL: Shader compilation failed. Exiting." << std::endl;
-        return -1;
-    }
+    if (shader.id == 0) return -1;
+    ShaderProgram boxShader = CreateBoxShader(); 
+    if (boxShader.id == 0) return -1;
+    GLuint cubeVAO = CreateCubeVAO(); 
     
     GL::glUseProgram(shader.id);
-
-    GLuint texArrayID = CreatePaletteTextureArray();
-    glActiveTexture(GL_TEXTURE0);
+    GLuint texArrayID = CreatePaletteTextureArray(); 
+    GL::glActiveTexture(GL_TEXTURE0);
     GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texArrayID);
     GL::glUniform1i(shader.loc_textureArray, 0);
 
     float camX = 0.0f, camY = 40.0f, camZ = 0.0f;
     float yaw = -90.0f, pitch = -30.0f;
     bool showGrid = false;
+    bool enableOcclusion = occlusionSupported; 
 
-    Profiler frameTimer, logicTimer, renderTimer;
-    double logicTimeMs=0, renderTimeMs=0, acc=0;
+    Profiler frameTimer;
+    double acc=0;
     int frames=0;
+    int drawnChunks = 0; 
+    int culledByOcclusion = 0;
+    unsigned int frameCounter = 0;
+
+    std::vector<GL::DrawElementsIndirectCommand> visibleCommands;
+    std::vector<GpuChunkInfo> visibleChunkInfos;
+    struct ChunkDist { size_t index; float distSq; };
+    std::vector<ChunkDist> visibleIndices;
 
     bool running = true;
     while(running) {
         frameTimer.begin();
-        logicTimer.begin();
         SDL_Event ev;
         while(SDL_PollEvent(&ev)) {
              if(ev.type == SDL_EVENT_QUIT) running = false;
              if(ev.type == SDL_EVENT_KEY_DOWN) {
                  if (ev.key.key == SDLK_ESCAPE) { mouseCaptured = false; SDL_SetWindowRelativeMouseMode(window, false); }
                  if (ev.key.key == SDLK_G) showGrid = !showGrid;
+                 if (ev.key.key == SDLK_O && occlusionSupported) enableOcclusion = !enableOcclusion;
              }
              if(ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) { mouseCaptured = true; SDL_SetWindowRelativeMouseMode(window, true); }
              if(ev.type == SDL_EVENT_MOUSE_MOTION && mouseCaptured) {
@@ -223,58 +198,198 @@ int main(int argc, char* argv[]) {
                  if(pitch > 89.0f) pitch = 89.0f; if(pitch < -89.0f) pitch = -89.0f;
              }
         }
-        float radYaw = yaw * 0.0174533f;
-        float radPitch = pitch * 0.0174533f;
-        Vec3 front = { std::cos(radYaw)*std::cos(radPitch), std::sin(radPitch), std::sin(radYaw)*std::cos(radPitch) };
-        front = Normalize(front);
+        
+        // --- 1. Check Query Results (Non-blocking) ---
+        culledByOcclusion = 0;
+        if(enableOcclusion && occlusionSupported) {
+            for(auto& rc : renderChunks) {
+                if(rc.waitingForQuery && rc.queryID != 0) {
+                    GLuint available = 0;
+                    GL::glGetQueryObjectuiv(rc.queryID, GL::QUERY_RESULT_AVAILABLE, &available);
+                    
+                    if (available) {
+                        GLuint result = 1;
+                        GL::glGetQueryObjectuiv(rc.queryID, GL::QUERY_RESULT, &result);
+                        
+                        // Якщо семплів > 0 - чанк видно.
+                        rc.visible = (result > 0);
+                        rc.waitingForQuery = false; 
+                    } 
+                    // Якщо не доступний - продовжуємо використовувати попередній стан
+                }
+                
+                if (!rc.visible) culledByOcclusion++;
+            }
+        } else {
+            for(auto& rc : renderChunks) rc.visible = true;
+        }
+
+        float radYaw = yaw * 0.0174533f; float radPitch = pitch * 0.0174533f;
+        Vec3 front = Normalize({ std::cos(radYaw)*std::cos(radPitch), std::sin(radPitch), std::sin(radYaw)*std::cos(radPitch) });
         Vec3 right = Normalize(Cross(front, {0,1,0}));
         const bool* keys = SDL_GetKeyboardState(nullptr);
-        float speed = 0.5f;
-        if(keys[SDL_SCANCODE_LSHIFT]) speed = 1.5f;
+        float speed = 0.5f; if(keys[SDL_SCANCODE_LSHIFT]) speed = 1.5f;
         if(keys[SDL_SCANCODE_W]) { camX += front.x*speed; camY += front.y*speed; camZ += front.z*speed; }
         if(keys[SDL_SCANCODE_S]) { camX -= front.x*speed; camY -= front.y*speed; camZ -= front.z*speed; }
         if(keys[SDL_SCANCODE_A]) { camX -= right.x*speed; camY -= right.y*speed; camZ -= right.z*speed; }
         if(keys[SDL_SCANCODE_D]) { camX += right.x*speed; camY += right.y*speed; camZ += right.z*speed; }
-        logicTimeMs = logicTimer.end();
 
-        renderTimer.begin();
-        int w, h; SDL_GetWindowSizeInPixels(window, &w, &h); glViewport(0,0,w,h);
-        glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Темний фон, щоб бачити, чи працює очистка
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        
-        glEnable(GL_DEPTH_TEST); 
-        glEnable(GL_CULL_FACE); 
-        glCullFace(GL_BACK); 
-        glFrontFace(GL_CCW);
-
+        int w, h; SDL_GetWindowSizeInPixels(window, &w, &h);
         Mat4 view = LookAt({camX, camY, camZ}, {camX+front.x, camY+front.y, camZ+front.z}, {0,1,0});
         Mat4 proj = Perspective(1.047f, (float)w/h, 0.1f, 1000.0f); 
+        Mat4 vp = MultiplyMat4(proj, view);
+        Frustum frustum = CreateFrustum(vp);
+        
+        // --- 2. Frustum Check ---
+        visibleIndices.clear();
+        for(size_t i=0; i<renderChunks.size(); ++i) {
+            auto& rc = renderChunks[i];
+            float minX = (float)rc.chunkX * CHUNK_SIZE;
+            float minZ = (float)rc.chunkZ * CHUNK_SIZE;
+            
+            // Large padding (4.0) to prevent flickering at edges
+            float pad = 4.0f; 
+            bool inFrustum = FrustumCheckAABB(frustum, 
+                minX - pad, -pad, minZ - pad, 
+                minX + CHUNK_SIZE + pad, CHUNK_SIZE + pad, minZ + CHUNK_SIZE + pad
+            );
+            
+            float distSq = (minX+16-camX)*(minX+16-camX) + (CHUNK_SIZE/2-camY)*(CHUNK_SIZE/2-camY) + (minZ+16-camZ)*(minZ+16-camZ);
 
+            // "Nearby" check: Тільки чанк, в якому ми знаходимось (дуже малий радіус)
+            bool isNearby = distSq < (CHUNK_SIZE * 0.7f * CHUNK_SIZE * 0.7f);
+
+            // FIX FLICKERING:
+            // Якщо чанк тільки що увійшов у фрустум - робимо його видимим миттєво.
+            if (inFrustum && !rc.wasInFrustum) {
+                rc.visible = true;
+                rc.waitingForQuery = false; // Force a new query logic cycle
+            }
+            rc.wasInFrustum = inFrustum;
+
+            if (isNearby) {
+                rc.visible = true;
+                rc.waitingForQuery = false;
+            } else if (!inFrustum) {
+                // Keep visible flag true so it's ready when we turn back,
+                // but it won't be rendered because of 'inFrustum' check below.
+                rc.visible = true; 
+                rc.waitingForQuery = false;
+            }
+
+            if(inFrustum && rc.visible) {
+                visibleIndices.push_back({i, distSq});
+            }
+        }
+
+        std::sort(visibleIndices.begin(), visibleIndices.end(), [](const ChunkDist& a, const ChunkDist& b) {
+            return a.distSq < b.distSq;
+        });
+
+        visibleCommands.clear();
+        visibleChunkInfos.clear();
+        for (const auto& item : visibleIndices) {
+            const auto& rc = renderChunks[item.index];
+            visibleCommands.push_back({6, (GLuint)rc.gpuQuads.size(), 0, 0, 0});
+            visibleChunkInfos.push_back({rc.chunkX * CHUNK_SIZE, rc.chunkZ * CHUNK_SIZE, rc.globalBufferOffset, 0});
+        }
+        drawnChunks = visibleCommands.size();
+        
+        if (!visibleCommands.empty()) {
+            GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboChunks);
+            GL::glBufferSubData(GL::SHADER_STORAGE_BUFFER, 0, visibleChunkInfos.size() * sizeof(GpuChunkInfo), visibleChunkInfos.data());
+            GL::glBindBuffer(GL::DRAW_INDIRECT_BUFFER, indirectBuffer);
+            GL::glBufferSubData(GL::DRAW_INDIRECT_BUFFER, 0, visibleCommands.size() * sizeof(GL::DrawElementsIndirectCommand), visibleCommands.data());
+        }
+
+        // --- 3. Render Geometry ---
+        GL::glViewport(0,0,w,h);
+        GL::glClearColor(0.1f, 0.1f, 0.1f, 1.0f); 
+        GL::glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        GL::glEnable(GL_DEPTH_TEST); 
+        GL::glEnable(GL_CULL_FACE);
+        GL::glDepthMask(GL_TRUE); 
+
+        GL::glUseProgram(shader.id);
         GL::glUniformMatrix4fv(shader.loc_view, 1, GL_FALSE, view.m);
         GL::glUniformMatrix4fv(shader.loc_proj, 1, GL_FALSE, proj.m);
         GL::glUniform1i(shader.loc_showGrid, showGrid ? 1 : 0);
 
-        GL::glBindVertexArray(emptyVAO); // VAO вже має IBO
-        GL::glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirectBuffer);
-        
-        GL::glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, (GLsizei)commands.size(), 0);
+        GL::glBindVertexArray(emptyVAO); 
+        GL::glBindBuffer(GL::DRAW_INDIRECT_BUFFER, indirectBuffer);
+        if (drawnChunks > 0) {
+            GL::glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, (GLsizei)drawnChunks, 0);
+        }
+
+        // --- 4. SMART Query Pass (OPTIMIZED) ---
+        if(enableOcclusion && occlusionSupported) {
+            GL::glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            GL::glDepthMask(GL_FALSE);
+            
+            GL::glUseProgram(boxShader.id);
+            GL::glBindVertexArray(cubeVAO);
+            
+            for(size_t i=0; i<renderChunks.size(); ++i) {
+                ChunkRenderDataExtended& rc = renderChunks[i];
+                
+                if (rc.queryID == 0) continue;
+
+                float cx = (float)rc.chunkX * CHUNK_SIZE;
+                float cz = (float)rc.chunkZ * CHUNK_SIZE;
+                
+                // Пропускаємо перевірку для дуже близьких чанків
+                float distSq = (cx+16-camX)*(cx+16-camX) + (CHUNK_SIZE/2-camY)*(CHUNK_SIZE/2-camY) + (cz+16-camZ)*(cz+16-camZ);
+                if (distSq < (CHUNK_SIZE * 0.7f * CHUNK_SIZE * 0.7f)) continue;
+
+                // Frustum Check для запиту
+                bool inFrustum = FrustumCheckAABB(frustum, cx, 0, cz, cx+32, 32, cz+32);
+                if (!inFrustum) continue;
+
+                bool doQuery = false;
+                
+                // STRATEGY: Lazy Hiding / Eager Showing
+                // 1. Якщо чанк ВИДИМИЙ - перевіряємо РІДКО (раз на 30 кадрів). 
+                //    Ми хочемо заощадити FPS. Якщо він сховається, ми дізнаємось про це пізніше,
+                //    але це краще, ніж гальмувати кожен кадр.
+                // 2. Якщо чанк СХОВАНИЙ - перевіряємо ЧАСТО (кожні 3 кадри).
+                //    Щоб він швидко з'явився, якщо стіна перед ним зникне.
+                
+                int interval = rc.visible ? 30 : 3;
+                
+                if ((frameCounter + i) % interval == 0) {
+                    doQuery = true;
+                }
+
+                if (doQuery) {
+                    Mat4 model = Identity();
+                    model.m[0] = (float)CHUNK_SIZE; model.m[5] = (float)CHUNK_SIZE; model.m[10] = (float)CHUNK_SIZE;
+                    model.m[12] = cx; model.m[13] = 0.0f; model.m[14] = cz;
+                    Mat4 mvp = MultiplyMat4(vp, model);
+                    GL::glUniformMatrix4fv(boxShader.loc_model, 1, GL_FALSE, mvp.m);
+
+                    GL::glBeginQuery(GL_ANY_SAMPLES_PASSED_CONSERVATIVE, rc.queryID);
+                    GL::glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, 0);
+                    GL::glEndQuery(GL_ANY_SAMPLES_PASSED_CONSERVATIVE);
+                    
+                    rc.waitingForQuery = true;
+                }
+            }
+            
+            GL::glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            GL::glDepthMask(GL_TRUE);
+        }
 
         SDL_GL_SwapWindow(window);
-        renderTimeMs = renderTimer.end();
         
-        double currentFrameTime = frameTimer.end();
-        acc += currentFrameTime;
+        acc += frameTimer.end();
         frames++;
+        frameCounter++;
         
         if (acc >= 500.0) {
-            double avg = acc / frames;
-            // Уникаємо ділення на нуль
-            double fps = (avg > 0.0001) ? 1000.0 / avg : 9999.0;
-            
+            double fps = (frames * 1000.0) / acc;
             std::stringstream ss;
             ss << "Voxel Engine | " << std::fixed << std::setprecision(1) << fps << " FPS | "
-               << std::setprecision(3) << avg << "ms | "
-               << "L:" << logicTimeMs << " R:" << renderTimeMs;
+               << "Drawn: " << drawnChunks << " | Culled(Occ): " << culledByOcclusion;
             SDL_SetWindowTitle(window, ss.str().c_str());
             acc = 0; frames = 0;
         }

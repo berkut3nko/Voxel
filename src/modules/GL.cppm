@@ -3,7 +3,28 @@ module;
 #include <SDL3/SDL_opengl.h>
 export module VoxelGame.GL;
 
+// Скасовуємо макроси, щоб використати їх імена як константи в namespace
+#ifdef GL_SHADER_STORAGE_BUFFER
+#undef GL_SHADER_STORAGE_BUFFER
+#endif
+#ifdef GL_DRAW_INDIRECT_BUFFER
+#undef GL_DRAW_INDIRECT_BUFFER
+#endif
+#ifdef GL_SAMPLES_PASSED
+#undef GL_SAMPLES_PASSED
+#endif
+#ifdef GL_ANY_SAMPLES_PASSED
+#undef GL_ANY_SAMPLES_PASSED
+#endif
+#ifdef GL_QUERY_RESULT
+#undef GL_QUERY_RESULT
+#endif
+#ifdef GL_QUERY_RESULT_AVAILABLE
+#undef GL_QUERY_RESULT_AVAILABLE
+#endif
+
 export namespace VoxelGame::GL {
+    // --- Existing Type Definitions ---
     typedef void (APIENTRY *PFN_GLGENVERTEXARRAYS) (GLsizei n, GLuint *arrays);
     typedef void (APIENTRY *PFN_GLBINDVERTEXARRAY) (GLuint array);
     typedef void (APIENTRY *PFN_GLGENBUFFERS) (GLsizei n, GLuint *buffers);
@@ -33,12 +54,41 @@ export namespace VoxelGame::GL {
     typedef void (APIENTRY *PFN_GLTEXIMAGE3D) (GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels);
     typedef void (APIENTRY *PFN_GLTEXSUBIMAGE3D) (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels);
     typedef void (APIENTRY *PFN_GLTEXPARAMETERI) (GLenum target, GLenum pname, GLint param);
-    #define GL_SHADER_STORAGE_BUFFER 0x90D2
     typedef void (APIENTRY *PFN_GLBINDBUFFERBASE) (GLenum target, GLuint index, GLuint buffer);
+    typedef void (APIENTRY *PFN_GLMULTIDRAWARRAYSINDIRECT) (GLenum mode, const void *indirect, GLsizei drawcount, GLsizei stride);
+    typedef void (APIENTRY *PFN_GLMULTIDRAWELEMENTSINDIRECT) (GLenum mode, GLenum type, const void *indirect, GLsizei drawcount, GLsizei stride);
+
+    // --- Added Functions Definitions ---
+    typedef void (APIENTRY *PFN_GLACTIVETEXTURE) (GLenum texture);
+    typedef void (APIENTRY *PFN_GLDRAWELEMENTS) (GLenum mode, GLsizei count, GLenum type, const void *indices);
+    typedef void (APIENTRY *PFN_GLVIEWPORT) (GLint x, GLint y, GLsizei width, GLsizei height);
+    typedef void (APIENTRY *PFN_GLCLEAR) (GLbitfield mask);
+    typedef void (APIENTRY *PFN_GLCLEARCOLOR) (GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
+    typedef void (APIENTRY *PFN_GLENABLE) (GLenum cap);
+    typedef void (APIENTRY *PFN_GLCULLFACE) (GLenum mode);
+    typedef void (APIENTRY *PFN_GLFRONTFACE) (GLenum mode);
+    // Note: glDepthMask defined below in Query Types section
+
+    // --- Occlusion Query Types ---
+    typedef void (APIENTRY *PFN_GLGENQUERIES) (GLsizei n, GLuint *ids);
+    typedef void (APIENTRY *PFN_GLDELETEQUERIES) (GLsizei n, const GLuint *ids);
+    typedef void (APIENTRY *PFN_GLBEGINQUERY) (GLenum target, GLuint id);
+    typedef void (APIENTRY *PFN_GLENDQUERY) (GLenum target);
+    typedef void (APIENTRY *PFN_GLGETQUERYOBJECTUIV) (GLuint id, GLenum pname, GLuint *params);
+    typedef void (APIENTRY *PFN_GLGETQUERYOBJECTIV) (GLuint id, GLenum pname, GLint *params);
+    typedef void (APIENTRY *PFN_GLCOLORMASK) (GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha);
+    typedef void (APIENTRY *PFN_GLDEPTHMASK) (GLboolean flag);
+
+    // --- Constants (Renamed to avoid macro collision) ---
+    // Removed "GL_" prefix. Usage: GL::SHADER_STORAGE_BUFFER
+    constexpr GLenum SHADER_STORAGE_BUFFER = 0x90D2;
+    constexpr GLenum DRAW_INDIRECT_BUFFER = 0x8F3F;
+    constexpr GLenum SAMPLES_PASSED = 0x8914;
+    constexpr GLenum ANY_SAMPLES_PASSED = 0x8C2F;
+    constexpr GLenum QUERY_RESULT = 0x8866;
+    constexpr GLenum QUERY_RESULT_AVAILABLE = 0x8867;
     
-    // Indirect Draw
-    #define GL_DRAW_INDIRECT_BUFFER 0x8F3F
-    
+    // --- Structs ---
     struct DrawArraysIndirectCommand {
         GLuint  count;
         GLuint  instanceCount;
@@ -53,10 +103,7 @@ export namespace VoxelGame::GL {
         GLuint  baseInstance;
     };
 
-    typedef void (APIENTRY *PFN_GLMULTIDRAWARRAYSINDIRECT) (GLenum mode, const void *indirect, GLsizei drawcount, GLsizei stride);
-    typedef void (APIENTRY *PFN_GLMULTIDRAWELEMENTSINDIRECT) (GLenum mode, GLenum type, const void *indirect, GLsizei drawcount, GLsizei stride);
-
-    // Function Pointers
+    // --- Function Pointers ---
     PFN_GLGENVERTEXARRAYS glGenVertexArrays;
     PFN_GLBINDVERTEXARRAY glBindVertexArray;
     PFN_GLGENBUFFERS glGenBuffers;
@@ -91,6 +138,26 @@ export namespace VoxelGame::GL {
     PFN_GLBINDBUFFERBASE glBindBufferBase;
     PFN_GLMULTIDRAWARRAYSINDIRECT glMultiDrawArraysIndirect;
     PFN_GLMULTIDRAWELEMENTSINDIRECT glMultiDrawElementsIndirect;
+
+    // --- Added Functions Pointers ---
+    PFN_GLACTIVETEXTURE glActiveTexture;
+    PFN_GLDRAWELEMENTS glDrawElements;
+    PFN_GLVIEWPORT glViewport;
+    PFN_GLCLEAR glClear;
+    PFN_GLCLEARCOLOR glClearColor;
+    PFN_GLENABLE glEnable;
+    PFN_GLCULLFACE glCullFace;
+    PFN_GLFRONTFACE glFrontFace;
+
+    // --- Occlusion Query Pointers ---
+    PFN_GLGENQUERIES glGenQueries;
+    PFN_GLDELETEQUERIES glDeleteQueries;
+    PFN_GLBEGINQUERY glBeginQuery;
+    PFN_GLENDQUERY glEndQuery;
+    PFN_GLGETQUERYOBJECTUIV glGetQueryObjectuiv;
+    PFN_GLGETQUERYOBJECTIV glGetQueryObjectiv;
+    PFN_GLCOLORMASK glColorMask;
+    PFN_GLDEPTHMASK glDepthMask;
 
     void LoadFunctions() {
         glGenVertexArrays = (PFN_GLGENVERTEXARRAYS)SDL_GL_GetProcAddress("glGenVertexArrays");
@@ -127,5 +194,25 @@ export namespace VoxelGame::GL {
         glBindBufferBase = (PFN_GLBINDBUFFERBASE)SDL_GL_GetProcAddress("glBindBufferBase");
         glMultiDrawArraysIndirect = (PFN_GLMULTIDRAWARRAYSINDIRECT)SDL_GL_GetProcAddress("glMultiDrawArraysIndirect");
         glMultiDrawElementsIndirect = (PFN_GLMULTIDRAWELEMENTSINDIRECT)SDL_GL_GetProcAddress("glMultiDrawElementsIndirect");
+
+        // --- Load Added Functions ---
+        glActiveTexture = (PFN_GLACTIVETEXTURE)SDL_GL_GetProcAddress("glActiveTexture");
+        glDrawElements = (PFN_GLDRAWELEMENTS)SDL_GL_GetProcAddress("glDrawElements");
+        glViewport = (PFN_GLVIEWPORT)SDL_GL_GetProcAddress("glViewport");
+        glClear = (PFN_GLCLEAR)SDL_GL_GetProcAddress("glClear");
+        glClearColor = (PFN_GLCLEARCOLOR)SDL_GL_GetProcAddress("glClearColor");
+        glEnable = (PFN_GLENABLE)SDL_GL_GetProcAddress("glEnable");
+        glCullFace = (PFN_GLCULLFACE)SDL_GL_GetProcAddress("glCullFace");
+        glFrontFace = (PFN_GLFRONTFACE)SDL_GL_GetProcAddress("glFrontFace");
+
+        // --- Occlusion Query Loading ---
+        glGenQueries = (PFN_GLGENQUERIES)SDL_GL_GetProcAddress("glGenQueries");
+        glDeleteQueries = (PFN_GLDELETEQUERIES)SDL_GL_GetProcAddress("glDeleteQueries");
+        glBeginQuery = (PFN_GLBEGINQUERY)SDL_GL_GetProcAddress("glBeginQuery");
+        glEndQuery = (PFN_GLENDQUERY)SDL_GL_GetProcAddress("glEndQuery");
+        glGetQueryObjectuiv = (PFN_GLGETQUERYOBJECTUIV)SDL_GL_GetProcAddress("glGetQueryObjectuiv");
+        glGetQueryObjectiv = (PFN_GLGETQUERYOBJECTIV)SDL_GL_GetProcAddress("glGetQueryObjectiv");
+        glColorMask = (PFN_GLCOLORMASK)SDL_GL_GetProcAddress("glColorMask");
+        glDepthMask = (PFN_GLDEPTHMASK)SDL_GL_GetProcAddress("glDepthMask");
     }
 }
