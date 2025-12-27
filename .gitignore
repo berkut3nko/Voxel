@@ -1,0 +1,12 @@
+*.o
+*.so
+*.a
+*.exe
+*.cfg
+.vscode/
+build/
+deps_cache/
+**/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
