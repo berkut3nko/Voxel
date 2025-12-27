@@ -85,7 +85,7 @@ int main(int argc, char* argv[]) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 
-    SDL_Window* window = SDL_CreateWindow("Voxel Game - Texture Arrays", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    SDL_Window* window = SDL_CreateWindow("Voxel Game - Texture Arrays & Debug Grid", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     SDL_GLContext context = SDL_GL_CreateContext(window);
     
     GL::LoadFunctions();
@@ -148,10 +148,20 @@ int main(int argc, char* argv[]) {
     GL::glBindBuffer(GL_ARRAY_BUFFER, VBO);
     GL::glBufferData(GL_ARRAY_BUFFER, allVertices.size() * sizeof(PackedVertex), allVertices.data(), GL_STATIC_DRAW);
 
-    GL::glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, sizeof(PackedVertex), (void*)0);
+    // Vertex Layout (12 bytes stride)
+    GLsizei stride = sizeof(PackedVertex);
+    
+    // Loc 0: PackedPos (uint)
+    GL::glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, stride, (void*)0);
     GL::glEnableVertexAttribArray(0);
-    GL::glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, sizeof(PackedVertex), (void*)(sizeof(uint32_t)));
+    
+    // Loc 1: PackedAttr (uint)
+    GL::glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, stride, (void*)(sizeof(uint32_t)));
     GL::glEnableVertexAttribArray(1);
+
+    // Loc 2: PackedUV (uint)
+    GL::glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, stride, (void*)(2 * sizeof(uint32_t)));
+    GL::glEnableVertexAttribArray(2);
 
     GLuint prog = CreateProgram("src/shaders/voxel.vert.glsl", "src/shaders/voxel.frag.glsl");
     GL::glUseProgram(prog);
@@ -164,6 +174,7 @@ int main(int argc, char* argv[]) {
 
     float camX = 16.0f, camY = 40.0f, camZ = 60.0f;
     float yaw = -90.0f, pitch = -30.0f;
+    bool showGrid = false;
 
     bool running = true;
     while(running) {
@@ -175,6 +186,10 @@ int main(int argc, char* argv[]) {
                 if (ev.key.key == SDLK_ESCAPE) {
                     mouseCaptured = false;
                     SDL_SetWindowRelativeMouseMode(window, false);
+                }
+                if (ev.key.key == SDLK_G) { // Перемикач сітки
+                    showGrid = !showGrid;
+                    std::cout << "Grid: " << (showGrid ? "ON" : "OFF") << std::endl;
                 }
             }
             if(ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !mouseCaptured) {
@@ -222,6 +237,7 @@ int main(int argc, char* argv[]) {
         GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_model"), 1, GL_FALSE, model.m);
         GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_view"), 1, GL_FALSE, view.m);
         GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_proj"), 1, GL_FALSE, proj.m);
+        GL::glUniform1i(GL::glGetUniformLocation(prog, "u_showGrid"), showGrid ? 1 : 0);
 
         GL::glBindVertexArray(VAO);
         glActiveTexture(GL_TEXTURE0);

@@ -2,6 +2,7 @@
 
 layout (location = 0) in uint aPackedPos;
 layout (location = 1) in uint aPackedAttr;
+layout (location = 2) in uint aPackedUV; // Додано вхідний атрибут
 
 uniform mat4 u_model;
 uniform mat4 u_view;
@@ -10,6 +11,7 @@ uniform mat4 u_proj;
 out vec3 v_pos;      // Світова позиція (для UV)
 out vec3 v_normal;   // Нормаль
 out float v_texLayer; // Індекс шару
+out vec2 v_quadUV;    // Додано вихідну змінну для сітки
 
 vec3 getNormal(uint idx) {
     if (idx == 0u) return vec3(1, 0, 0); 
@@ -36,6 +38,10 @@ void main() {
 
     // Розпаковка шару: біти 3-10
     v_texLayer = float((aPackedAttr >> 3u) & 0xFFu);
+
+    float u = float(aPackedUV & 0xFFFFu) / 65535.0;
+    float v = float((aPackedUV >> 16u) & 0xFFFFu) / 65535.0;
+    v_quadUV = vec2(u, v);
 
     v_pos = worldPos.xyz;
 }
