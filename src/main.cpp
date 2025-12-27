@@ -31,20 +31,15 @@ GLuint CreatePaletteTextureArray() {
     GL::glGenTextures(1, &texID);
     GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texID);
 
-    // Parameters: 16x16 pixels per block, 8 layers
     int width = 16;
     int height = 16;
     int layers = 8; 
 
-    // Allocate storage for Texture Array
-    // GL_RGB8, width, height, layers
     GL::glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGB8, width, height, layers, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
 
-    // Helper lambda to fill a layer with color
     auto FillLayer = [&](int layer, uint8_t r, uint8_t g, uint8_t b) {
         std::vector<uint8_t> data(width * height * 3);
         for (int i = 0; i < width * height; ++i) {
-            // Add some noise pattern
             uint8_t noise = (rand() % 40); 
             data[i*3+0] = (r > noise) ? r - noise : 0;
             data[i*3+1] = (g > noise) ? g - noise : 0;
@@ -53,23 +48,14 @@ GLuint CreatePaletteTextureArray() {
         GL::glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, width, height, 1, GL_RGB, GL_UNSIGNED_BYTE, data.data());
     };
 
-    // ID 1: Grass -> Layer 0
     FillLayer(0, 50, 200, 50);
-    // ID 2: Dirt -> Layer 1
     FillLayer(1, 139, 69, 19);
-    // ID 3: Snow -> Layer 2
     FillLayer(2, 240, 240, 255);
-    // ID 4: Internal -> Layer 3 (Dark Gray)
     FillLayer(3, 50, 50, 50);
-    // ID 5: Pillar -> Layer 4 (Blueish)
     FillLayer(4, 100, 100, 255);
-    // ID 6: Wall -> Layer 5 (Redbrick)
     FillLayer(5, 200, 80, 80);
-    // ID 7: Slab -> Layer 6 (Stone)
     FillLayer(6, 128, 128, 128);
 
-    // Texture Parameters
-    // GL_REPEAT ensures correct tiling!
     GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -98,7 +84,6 @@ int main(int argc, char* argv[]) {
     WorldManager world;
     int seed = std::time(nullptr) % 1000;
     
-    // Generate Chunks
     for (int cx = -1; cx <= 1; ++cx) {
         for (int cz = -1; cz <= 1; ++cz) {
             VoxelChunk& chunk = world.createChunk(cx, cz);
@@ -106,7 +91,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Mesh
     std::vector<ChunkRenderData> renderChunks;
     for (int cx = -1; cx <= 1; ++cx) {
         for (int cz = -1; cz <= 1; ++cz) {
@@ -148,25 +132,24 @@ int main(int argc, char* argv[]) {
     GL::glBindBuffer(GL_ARRAY_BUFFER, VBO);
     GL::glBufferData(GL_ARRAY_BUFFER, allVertices.size() * sizeof(PackedVertex), allVertices.data(), GL_STATIC_DRAW);
 
-    // Vertex Layout (12 bytes stride)
-    GLsizei stride = sizeof(PackedVertex);
+    // [FIX] Updated Vertex Layout (Stride = 12 bytes)
+    GLsizei stride = sizeof(PackedVertex); // 12 bytes
     
-    // Loc 0: PackedPos (uint)
+    // Loc 0: PackedPos (uint) -> Offset 0
     GL::glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, stride, (void*)0);
     GL::glEnableVertexAttribArray(0);
     
-    // Loc 1: PackedAttr (uint)
+    // Loc 1: PackedAttr (uint) -> Offset 4
     GL::glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, stride, (void*)(sizeof(uint32_t)));
     GL::glEnableVertexAttribArray(1);
 
-    // Loc 2: PackedUV (uint)
+    // [FIX] Loc 2: PackedUV (uint) -> Offset 8
     GL::glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, stride, (void*)(2 * sizeof(uint32_t)));
     GL::glEnableVertexAttribArray(2);
 
     GLuint prog = CreateProgram("src/shaders/voxel.vert.glsl", "src/shaders/voxel.frag.glsl");
     GL::glUseProgram(prog);
 
-    // Create Palette (Texture Array)
     GLuint texArrayID = CreatePaletteTextureArray();
     glActiveTexture(GL_TEXTURE0);
     GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texArrayID);
@@ -174,7 +157,7 @@ int main(int argc, char* argv[]) {
 
     float camX = 16.0f, camY = 40.0f, camZ = 60.0f;
     float yaw = -90.0f, pitch = -30.0f;
-    bool showGrid = false;
+    bool showGrid = false; // Default: Grid OFF
 
     bool running = true;
     while(running) {
@@ -187,7 +170,7 @@ int main(int argc, char* argv[]) {
                     mouseCaptured = false;
                     SDL_SetWindowRelativeMouseMode(window, false);
                 }
-                if (ev.key.key == SDLK_G) { // Перемикач сітки
+                if (ev.key.key == SDLK_G) { // Grid Toggle
                     showGrid = !showGrid;
                     std::cout << "Grid: " << (showGrid ? "ON" : "OFF") << std::endl;
                 }
@@ -237,6 +220,7 @@ int main(int argc, char* argv[]) {
         GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_model"), 1, GL_FALSE, model.m);
         GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_view"), 1, GL_FALSE, view.m);
         GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_proj"), 1, GL_FALSE, proj.m);
+        // [FIX] Pass grid toggle uniform
         GL::glUniform1i(GL::glGetUniformLocation(prog, "u_showGrid"), showGrid ? 1 : 0);
 
         GL::glBindVertexArray(VAO);

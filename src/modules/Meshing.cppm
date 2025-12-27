@@ -23,11 +23,10 @@ export namespace VoxelGame::Meshing {
         int face; 
     };
 
-    // Оновлена структура вершини: 3x uint32 (12 байт)
     struct PackedVertex {
-        uint32_t positionData;  // X, Y, Z
-        uint32_t attributeData; // Normal, Texture Layer
-        uint32_t quadUV;        // Local Quad UV (Normalized 0..1)
+        uint32_t positionData; 
+        uint32_t attributeData; 
+        uint32_t quadUV;        
     };
 
     uint32_t packPos(int x, int y, int z) {
@@ -38,7 +37,6 @@ export namespace VoxelGame::Meshing {
         return (normal & 0x07) | ((texLayer & 0xFF) << 3);
     }
 
-    // Pack floats 0.0f..1.0f into uint32 (0..65535)
     uint32_t packUV(float u, float v) {
         uint16_t ui = (uint16_t)(u * 65535.0f);
         uint16_t vi = (uint16_t)(v * 65535.0f);
@@ -120,11 +118,11 @@ export namespace VoxelGame::Meshing {
                             
                             VoxelType faceType = AIR;
 
-                            if (side == 0) { // Normal (+)
+                            if (side == 0) { 
                                 if (x[d] >= 0 && x[d] < CHUNK_SIZE) {
                                     if (cSolid && !nSolid) faceType = curr;
                                 }
-                            } else { // Normal (-)
+                            } else { 
                                 int nextPos = x[d] + 1;
                                 if (nextPos >= 0 && nextPos < CHUNK_SIZE) {
                                     if (!cSolid && nSolid) faceType = next;
@@ -195,38 +193,36 @@ export namespace VoxelGame::Meshing {
             struct P { int x,y,z; };
             P p1, p2, p3, p4;
 
-            // Coordinates
+            // FIX: Remove redundant +1 for Positive Faces (X+, Y+, Z+)
+            // GenerateQuads already sets x0/y0/z0 to the correct plane boundary.
+
             switch(face) {
-                case 0: // X+ (Right)
+                case 0: // X+ (Right) -> FIXED
                     // Normal (1,0,0)
-                    // x0 is ALREADY the plane coordinate (e.g. x=1 for block at x=0)
-                    // DO NOT add +1 to x0
-                    p1 = {x0, y0,   z0};
-                    p2 = {x0, y0+w, z0};
-                    p3 = {x0, y0+w, z0+h};
-                    p4 = {x0, y0,   z0+h};
+                    // x0 is already x+1 from GenerateQuads
+                    p1 = {x0,   y0,   z0};
+                    p2 = {x0,   y0+w, z0};
+                    p3 = {x0,   y0+w, z0+h};
+                    p4 = {x0,   y0,   z0+h};
                     break;
 
                 case 1: // X- (Left)
                     // Normal (-1,0,0)
-                    // x0 is the plane coordinate
                     p1 = {x0, y0,   z0};
                     p2 = {x0, y0,   z0+h};
                     p3 = {x0, y0+w, z0+h};
                     p4 = {x0, y0+w, z0};
                     break;
 
-                case 2: // Y+ (Top) -> FIX APPLIED
+                case 2: // Y+ (Top) -> FIXED previously
                     // Normal (0,1,0)
-                    // y0 is ALREADY the plane coordinate
-                    // DO NOT add +1 to y0
                     p1 = {x0,   y0, z0};
                     p2 = {x0,   y0, z0+w}; 
                     p3 = {x0+h, y0, z0+w}; 
                     p4 = {x0+h, y0, z0};
                     break;
 
-                case 3: // Y- (Bottom) -> FIX APPLIED
+                case 3: // Y- (Bottom)
                     // Normal (0,-1,0)
                     p1 = {x0,   y0, z0};
                     p2 = {x0+h, y0, z0};
@@ -234,10 +230,9 @@ export namespace VoxelGame::Meshing {
                     p4 = {x0,   y0, z0+w};
                     break;
 
-                case 4: // Z+ (Front)
+                case 4: // Z+ (Front) -> FIXED
                     // Normal (0,0,1)
-                    // z0 is ALREADY the plane coordinate
-                    // DO NOT add +1 to z0
+                    // z0 is already z+1
                     p1 = {x0,   y0,   z0};
                     p2 = {x0+w, y0,   z0};
                     p3 = {x0+w, y0+h, z0};
@@ -255,7 +250,6 @@ export namespace VoxelGame::Meshing {
 
             uint32_t attr = packAttr(face, texLayer);
 
-            // Normalized UVs for Debug Grid (0..1)
             uint32_t uv00 = packUV(0.0f, 0.0f);
             uint32_t uv10 = packUV(1.0f, 0.0f);
             uint32_t uv11 = packUV(1.0f, 1.0f);
