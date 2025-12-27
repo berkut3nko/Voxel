@@ -6,6 +6,9 @@ module;
 #include <iostream>
 #include <bit> 
 #include <array>
+#include <type_traits>
+#include <cmath>
+#include <algorithm>
 export module VoxelGame.Meshing;
 
 import VoxelGame.Types;
@@ -23,13 +26,11 @@ export namespace VoxelGame::Meshing {
         int face; 
     };
 
-    // Структура для SSBO (8 байт), вирівняна як uvec2 у шейдері
     struct GpuQuad {
-        uint32_t data1; // x,y,z,face,tex
-        uint32_t data2; // w,h
+        uint32_t data1; 
+        uint32_t data2; 
     };
 
-    // Упаковка даних для SSBO
     uint32_t packData1(int x, int y, int z, int face, int texLayer) {
         return (x & 0xFF) | 
                ((y & 0xFF) << 8) | 
@@ -54,17 +55,21 @@ export namespace VoxelGame::Meshing {
         int h_v; 
     };
 
-    std::vector<BinaryQuad> greedy_mesh_binary_plane(std::array<uint32_t, 32> data) {
+    template <typename T, size_t N>
+    std::vector<BinaryQuad> GreedyMeshBinaryPlane(std::array<T, N> data) {
         std::vector<BinaryQuad> quads;
-        for (int row = 0; row < 32; ++row) {
+        using UT = std::make_unsigned_t<T>;
+        
+        for (int row = 0; row < N; ++row) {
             while (data[row] != 0) {
-                int u = std::countr_zero(data[row]);
-                int w_u = std::countr_one(data[row] >> u);
-                uint32_t h_mask_bits = (w_u == 32) ? 0xFFFFFFFF : ((1u << w_u) - 1);
-                uint32_t mask = h_mask_bits << u;
+                int u = std::countr_zero(static_cast<UT>(data[row]));
+                int w_u = std::countr_one(static_cast<UT>(data[row] >> u));
+                UT h_mask_bits = (w_u == sizeof(T)*8) ? static_cast<UT>(~0) : ((static_cast<UT>(1) << w_u) - 1);
+                UT mask = h_mask_bits << u;
+                
                 int h_v = 1; 
-                while (row + h_v < 32) {
-                    uint32_t next_row_bits = (data[row + h_v] >> u) & h_mask_bits;
+                while (row + h_v < N) {
+                    UT next_row_bits = (static_cast<UT>(data[row + h_v]) >> u) & h_mask_bits;
                     if (next_row_bits != h_mask_bits) break;
                     data[row + h_v] &= ~mask;
                     h_v++;
@@ -89,28 +94,102 @@ export namespace VoxelGame::Meshing {
         return AIR; 
     }
 
-    std::vector<Quad> GenerateQuads(const MeshingContext& ctx) {
+    // --- Сканування вглиб для пошуку поверхневого матеріалу ---
+    // d_start - координата початку сканування (поверхня)
+    // scan_dir - напрямок сканування вглиб блоку (-1 або +1)
+    VoxelType ScanDominantVoxel(const MeshingContext& ctx, 
+                               int u_start, int v_start, int d_start,
+                               int u_ax, int v_ax, int d_ax, 
+                               int step, int scan_dir) {
+        // Оптимізація для LOD 1 (step=1) - просто беремо воксель
+        if (step == 1) {
+            int pos[3];
+            pos[u_ax] = u_start;
+            pos[v_ax] = v_start;
+            pos[d_ax] = d_start;
+            return get_voxel_context(ctx, pos[0], pos[1], pos[2]);
+        }
+
+        int counts[MAX_MATERIAL_TYPES + 1] = {0};
+        
+        // Ітеруємося по поверхні грані (step x step)
+        for (int du = 0; du < step; ++du) {
+            for (int dv = 0; dv < step; ++dv) {
+                
+                // Raycast вглиб для кожного "пікселя" супер-вокселя
+                for (int k = 0; k < step; ++k) {
+                    int pos[3];
+                    pos[u_ax] = u_start + du;
+                    pos[v_ax] = v_start + dv;
+                    pos[d_ax] = d_start + (k * scan_dir); 
+
+                    VoxelType t = get_voxel_context(ctx, pos[0], pos[1], pos[2]);
+                    
+                    // Якщо знайшли непрозорий блок - це поверхня для цього променя
+                    if (!IsTransparent(t)) {
+                        int matID = GetMaterialID(t);
+                        if (matID >= MAX_MATERIAL_TYPES) matID = 0;
+                        
+                        counts[matID]++;
+                        break; // Зупиняємося, бо глибші вокселі закриті цим
+                    }
+                    // Якщо прозорий (AIR), продовжуємо йти вглиб (k++)
+                }
+            }
+        }
+
+        // Знаходимо переможця (Majority Vote)
+        int max_count = -1;
+        int winner_id = 0;
+
+        for (int i = 0; i < MAX_MATERIAL_TYPES; ++i) {
+            if (counts[i] > max_count) {
+                max_count = counts[i];
+                winner_id = i;
+            }
+        }
+
+        // Якщо перемогло повітря або нічого не знайдено
+        if (winner_id == 0) return AIR;
+
+        return (winner_id << 3) | 0x07;
+    }
+
+    template <typename T, size_t N>
+    std::vector<Quad> GenerateQuadsInternal(const MeshingContext& ctx, int step) {
         std::vector<Quad> resultQuads;
+        const int GRID_SIZE = N; 
 
         for (int d = 0; d < 3; ++d) {
             int u_ax = (d + 1) % 3;
             int v_ax = (d + 2) % 3;
             
-            int x[3] = {0, 0, 0}; 
+            int l_x[3] = {0, 0, 0}; 
             int q[3] = {0, 0, 0}; 
             q[d] = 1;
 
-            for (x[d] = -1; x[d] < CHUNK_SIZE; ++x[d]) {
+            for (l_x[d] = -1; l_x[d] < GRID_SIZE; ++l_x[d]) {
                 for (int side = 0; side < 2; ++side) {
                     
-                    std::vector<std::array<uint32_t, 32>> material_masks(MAX_MATERIAL_TYPES, {0});
+                    std::vector<std::array<T, N>> material_masks(MAX_MATERIAL_TYPES, {0});
                     bool any_face = false;
 
-                    for (x[v_ax] = 0; x[v_ax] < CHUNK_SIZE; ++x[v_ax]) {     
-                        for (x[u_ax] = 0; x[u_ax] < CHUNK_SIZE; ++x[u_ax]) { 
+                    for (l_x[v_ax] = 0; l_x[v_ax] < GRID_SIZE; ++l_x[v_ax]) {     
+                        for (l_x[u_ax] = 0; l_x[u_ax] < GRID_SIZE; ++l_x[u_ax]) { 
                             
-                            VoxelType curr = get_voxel_context(ctx, x[0], x[1], x[2]);
-                            VoxelType next = get_voxel_context(ctx, x[0] + q[0], x[1] + q[1], x[2] + q[2]);
+                            // Світова координата межі між супер-вокселями
+                            int world_boundary_d = (l_x[d] + 1) * step;
+
+                            int world_u = l_x[u_ax] * step;
+                            int world_v = l_x[v_ax] * step;
+
+                            // curr: знаходиться "зліва" від межі. 
+                            // Ми дивимось на його грань +d. Отже, скануємо від межі (boundary-1) ВНИЗ/ВЛІВО (-1).
+                            VoxelType curr = ScanDominantVoxel(ctx, world_u, world_v, world_boundary_d - 1, u_ax, v_ax, d, step, -1);
+                            
+                            // next: знаходиться "справа" від межі.
+                            // Ми дивимось на його грань -d. Отже, скануємо від межі (boundary) ВВЕРХ/ВПРАВО (+1).
+                            VoxelType next = ScanDominantVoxel(ctx, world_u, world_v, world_boundary_d,     u_ax, v_ax, d, step,  1);
 
                             bool cSolid = !IsTransparent(curr);
                             bool nSolid = !IsTransparent(next);
@@ -118,12 +197,12 @@ export namespace VoxelGame::Meshing {
                             VoxelType faceType = AIR;
 
                             if (side == 0) { 
-                                if (x[d] >= 0 && x[d] < CHUNK_SIZE) {
+                                if (l_x[d] >= 0 && l_x[d] < GRID_SIZE) {
                                     if (cSolid && !nSolid) faceType = curr;
                                 }
                             } else { 
-                                int nextPos = x[d] + 1;
-                                if (nextPos >= 0 && nextPos < CHUNK_SIZE) {
+                                int nextPos = l_x[d] + 1;
+                                if (nextPos >= 0 && nextPos < GRID_SIZE) {
                                     if (!cSolid && nSolid) faceType = next;
                                 }
                             }
@@ -131,7 +210,7 @@ export namespace VoxelGame::Meshing {
                             if (faceType != AIR) {
                                 int matID = GetMaterialID(faceType);
                                 if (matID < MAX_MATERIAL_TYPES) {
-                                    material_masks[matID][x[v_ax]] |= (1u << x[u_ax]);
+                                    material_masks[matID][l_x[v_ax]] |= (static_cast<T>(1) << l_x[u_ax]);
                                     any_face = true;
                                 }
                             }
@@ -141,29 +220,29 @@ export namespace VoxelGame::Meshing {
                     if (!any_face) continue;
 
                     for (int matID = 0; matID < MAX_MATERIAL_TYPES; ++matID) {
-                        auto binaryQuads = greedy_mesh_binary_plane(material_masks[matID]);
+                        auto binaryQuads = GreedyMeshBinaryPlane<T, N>(material_masks[matID]);
 
                         for (const auto& bq : binaryQuads) {
                             Quad q_final;
                             q_final.type = (matID << 3) | 0x07; 
                             
-                            int pos[3];
-                            pos[u_ax] = bq.u; 
-                            pos[v_ax] = bq.v; 
+                            int l_pos[3]; 
+                            l_pos[u_ax] = bq.u; 
+                            l_pos[v_ax] = bq.v; 
                             
                             if (side == 0) {
-                                pos[d] = x[d] + 1; 
+                                l_pos[d] = l_x[d] + 1; 
                                 q_final.face = d * 2; 
                             } else {
-                                pos[d] = x[d] + 1; 
+                                l_pos[d] = l_x[d] + 1; 
                                 q_final.face = d * 2 + 1; 
                             }
 
-                            q_final.x = pos[0];
-                            q_final.y = pos[1];
-                            q_final.z = pos[2];
-                            q_final.w = bq.w_u; 
-                            q_final.h = bq.h_v; 
+                            q_final.x = l_pos[0] * step;
+                            q_final.y = l_pos[1] * step;
+                            q_final.z = l_pos[2] * step;
+                            q_final.w = bq.w_u * step; 
+                            q_final.h = bq.h_v * step; 
 
                             resultQuads.push_back(q_final);
                         }
@@ -174,7 +253,19 @@ export namespace VoxelGame::Meshing {
         return resultQuads;
     }
 
-    // Замість Triangulate - збираємо дані для SSBO
+    std::vector<Quad> GenerateQuads(const MeshingContext& ctx, int lod) {
+        if (lod == 1) {
+            return GenerateQuadsInternal<uint32_t, 32>(ctx, 1);
+        }
+        else if (lod == 2) {
+            return GenerateQuadsInternal<uint16_t, 16>(ctx, 2);
+        }
+        else if (lod == 3) {
+            return GenerateQuadsInternal<uint8_t, 8>(ctx, 4);
+        }
+        return GenerateQuadsInternal<uint32_t, 32>(ctx, 1);
+    }
+
     std::vector<GpuQuad> BuildSSBOData(const std::vector<Quad>& quads) {
         std::vector<GpuQuad> gpuQuads;
         gpuQuads.reserve(quads.size());
@@ -189,5 +280,11 @@ export namespace VoxelGame::Meshing {
             gpuQuads.push_back({d1, d2});
         }
         return gpuQuads;
+    }
+
+    int GetChunkLOD(float distance) {
+        if (distance > 192.0f) return 3; 
+        if (distance > 96.0f) return 2;  
+        return 1;
     }
 }
