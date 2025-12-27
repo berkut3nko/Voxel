@@ -21,33 +21,18 @@ export namespace VoxelGame::Meshing {
         int face; 
     };
 
-    // Compact Vertex: 2x 32-bit integers (8 bytes per vertex!)
     struct PackedVertex {
-        uint32_t positionData; // X(8), Y(8), Z(8), Unused(8) or part of type
-        uint32_t attributeData; // Normal(3), Color(24), Type(5) -> packed
+        uint32_t positionData; 
+        uint32_t attributeData; // Normal(3), TextureLayer(8), Unused...
     };
 
-    // Helper to pack position (local 0-63 range supported)
     uint32_t packPos(int x, int y, int z) {
         return (x & 0xFF) | ((y & 0xFF) << 8) | ((z & 0xFF) << 16);
     }
 
-    // Helper to pack attributes
-    // Normal: 0..5 (3 bits)
-    // Type: 0..31 (5 bits)
-    // Color: R,G,B (approx 8 bits each, or simpler palette)
-    uint32_t packAttr(int normal, int type, uint8_t r, uint8_t g, uint8_t b) {
-        // Layout:
-        // Bits 0-2: Normal
-        // Bits 3-7: Type
-        // Bits 8-15: R
-        // Bits 16-23: G
-        // Bits 24-31: B
-        return (normal & 0x07) | 
-               ((type & 0x1F) << 3) |
-               ((uint32_t)r << 8) |
-               ((uint32_t)g << 16) |
-               ((uint32_t)b << 24);
+    // Pack attributes: Normal (3 bits) + Texture Layer (8 bits)
+    uint32_t packAttr(int normal, int texLayer) {
+        return (normal & 0x07) | ((texLayer & 0xFF) << 3);
     }
 
     struct MeshingContext {
@@ -234,62 +219,48 @@ export namespace VoxelGame::Meshing {
             int z0 = q.z;
             int w = q.w;
             int h = q.h;
-            int type = (q.type & MASK_TYPE) >> 3;
-
-            // Generate Random Color
-            uint8_t r = rand() % 255;
-            uint8_t g = rand() % 255;
-            uint8_t b = rand() % 255;
-            // Brighten
-            if (r+g+b < 100) { r += 100; g += 50; }
+            
+            // Отримуємо шар текстури з типу вокселя
+            int texLayer = GetTextureLayer(q.type);
+            if(texLayer < 0) texLayer = 0; // Fallback
 
             int face = q.face; // 0..5
             
-            // 4 Corner points (p1..p4)
             struct P { int x,y,z; };
             P p1, p2, p3, p4;
 
-            // Winding order is crucial for Back-Face Culling!
-            // GL_CCW is default.
-            
             switch(face) {
-                case 0: // X+ (Right)
-                    // Normal (1,0,0) -> Face 0
+                case 0: // X+
                     p1 = {x0+1, y0,   z0+h};
                     p2 = {x0+1, y0,   z0};
                     p3 = {x0+1, y0+w, z0};
                     p4 = {x0+1, y0+w, z0+h};
                     break;
-                case 1: // X- (Left)
-                    // Normal (-1,0,0) -> Face 1
+                case 1: // X-
                     p1 = {x0, y0,   z0};
                     p2 = {x0, y0,   z0+h};
                     p3 = {x0, y0+w, z0+h};
                     p4 = {x0, y0+w, z0};
                     break;
-                case 2: // Y+ (Top)
-                    // Normal (0,1,0) -> Face 2
+                case 2: // Y+
                     p1 = {x0,   y0+1, z0};
                     p2 = {x0,   y0+1, z0+w};
                     p3 = {x0+h, y0+1, z0+w};
                     p4 = {x0+h, y0+1, z0};
                     break;
-                case 3: // Y- (Bottom)
-                    // Normal (0,-1,0) -> Face 3
+                case 3: // Y-
                     p1 = {x0,   y0, z0+w};
                     p2 = {x0,   y0, z0};
                     p3 = {x0+h, y0, z0};
                     p4 = {x0+h, y0, z0+w};
                     break;
-                case 4: // Z+ (Front)
-                    // Normal (0,0,1) -> Face 4
+                case 4: // Z+
                     p1 = {x0,   y0,   z0+1};
                     p2 = {x0+w, y0,   z0+1};
                     p3 = {x0+w, y0+h, z0+1};
                     p4 = {x0,   y0+h, z0+1};
                     break;
-                case 5: // Z- (Back)
-                    // Normal (0,0,-1) -> Face 5
+                case 5: // Z-
                     p1 = {x0+w, y0,   z0};
                     p2 = {x0,   y0,   z0};
                     p3 = {x0,   y0+h, z0};
@@ -297,15 +268,12 @@ export namespace VoxelGame::Meshing {
                     break;
             }
 
-            // Pack Attributes once per quad
-            uint32_t attr = packAttr(face, type, r, g, b);
+            uint32_t attr = packAttr(face, texLayer);
 
-            // Triangle 1: p1, p2, p3
             vertices.push_back({ packPos(p1.x, p1.y, p1.z), attr });
             vertices.push_back({ packPos(p2.x, p2.y, p2.z), attr });
             vertices.push_back({ packPos(p3.x, p3.y, p3.z), attr });
 
-            // Triangle 2: p1, p3, p4
             vertices.push_back({ packPos(p1.x, p1.y, p1.z), attr });
             vertices.push_back({ packPos(p3.x, p3.y, p3.z), attr });
             vertices.push_back({ packPos(p4.x, p4.y, p4.z), attr });

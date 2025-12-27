@@ -14,7 +14,12 @@ export namespace VoxelGame::Types {
     constexpr VoxelType FLAG_Z        = 0x01;
     constexpr VoxelType FLAG_SOLID    = 0x80; 
 
-    // Типи блоків
+    // Типи блоків (ID = Type >> 3)
+    // 0: Air
+    // 1: Grass
+    // 2: Dirt
+    // 3: Snow
+    // 4: Internal
     constexpr VoxelType AIR      = 0x00; 
     constexpr VoxelType GRASS    = (1 << 3) | 0x07; 
     constexpr VoxelType DIRT     = (2 << 3) | 0x07; 
@@ -29,5 +34,16 @@ export namespace VoxelGame::Types {
 
     inline bool IsTransparent(VoxelType voxel) {
         return (voxel & MASK_FLAGS) == 0;
+    }
+
+    // Helper to get Texture Layer Index from Voxel Type
+    // For now, simple 1-to-1 mapping: (Type ID) - 1
+    // ID 0 (Air) -> No texture
+    // ID 1 (Grass) -> Layer 0
+    // ID 2 (Dirt) -> Layer 1
+    inline int GetTextureLayer(VoxelType voxel) {
+        int id = (voxel & MASK_TYPE) >> 3;
+        if (id == 0) return -1;
+        return id - 1;
     }
 }

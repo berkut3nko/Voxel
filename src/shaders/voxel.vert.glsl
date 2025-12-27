@@ -7,9 +7,9 @@ uniform mat4 u_model;
 uniform mat4 u_view;
 uniform mat4 u_proj;
 
-out vec3 v_pos;
-out vec3 v_normal;
-out vec3 v_color;
+out vec3 v_pos;      // Світова позиція (для UV)
+out vec3 v_normal;   // Нормаль
+out float v_texLayer; // Індекс шару
 
 vec3 getNormal(uint idx) {
     if (idx == 0u) return vec3(1, 0, 0); 
@@ -27,8 +27,6 @@ void main() {
     float z = float((aPackedPos >> 16u) & 0xFFu);
     
     vec3 localPos = vec3(x, y, z);
-    
-    // u_model now contains the chunk translation!
     vec4 worldPos = u_model * vec4(localPos, 1.0);
 
     gl_Position = u_proj * u_view * worldPos;
@@ -36,10 +34,8 @@ void main() {
     uint normIdx = aPackedAttr & 0x7u;
     v_normal = getNormal(normIdx);
 
-    float r = float((aPackedAttr >> 8u) & 0xFFu) / 255.0;
-    float g = float((aPackedAttr >> 16u) & 0xFFu) / 255.0;
-    float b = float((aPackedAttr >> 24u) & 0xFFu) / 255.0;
-    v_color = vec3(r, g, b);
+    // Розпаковка шару: біти 3-10
+    v_texLayer = float((aPackedAttr >> 3u) & 0xFFu);
 
     v_pos = worldPos.xyz;
 }

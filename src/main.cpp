@@ -20,11 +20,63 @@ using namespace VoxelGame::Shader;
 
 namespace GL = VoxelGame::GL;
 
-// Structure to hold mesh data per chunk
 struct ChunkRenderData {
     std::vector<PackedVertex> vertices;
     int chunkX, chunkZ;
 };
+
+// --- Palette Generation Helper ---
+GLuint CreatePaletteTextureArray() {
+    GLuint texID;
+    GL::glGenTextures(1, &texID);
+    GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texID);
+
+    // Parameters: 16x16 pixels per block, 8 layers
+    int width = 16;
+    int height = 16;
+    int layers = 8; 
+
+    // Allocate storage for Texture Array
+    // GL_RGB8, width, height, layers
+    GL::glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGB8, width, height, layers, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+
+    // Helper lambda to fill a layer with color
+    auto FillLayer = [&](int layer, uint8_t r, uint8_t g, uint8_t b) {
+        std::vector<uint8_t> data(width * height * 3);
+        for (int i = 0; i < width * height; ++i) {
+            // Add some noise pattern
+            uint8_t noise = (rand() % 40); 
+            data[i*3+0] = (r > noise) ? r - noise : 0;
+            data[i*3+1] = (g > noise) ? g - noise : 0;
+            data[i*3+2] = (b > noise) ? b - noise : 0;
+        }
+        GL::glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, width, height, 1, GL_RGB, GL_UNSIGNED_BYTE, data.data());
+    };
+
+    // ID 1: Grass -> Layer 0
+    FillLayer(0, 50, 200, 50);
+    // ID 2: Dirt -> Layer 1
+    FillLayer(1, 139, 69, 19);
+    // ID 3: Snow -> Layer 2
+    FillLayer(2, 240, 240, 255);
+    // ID 4: Internal -> Layer 3 (Dark Gray)
+    FillLayer(3, 50, 50, 50);
+    // ID 5: Pillar -> Layer 4 (Blueish)
+    FillLayer(4, 100, 100, 255);
+    // ID 6: Wall -> Layer 5 (Redbrick)
+    FillLayer(5, 200, 80, 80);
+    // ID 7: Slab -> Layer 6 (Stone)
+    FillLayer(6, 128, 128, 128);
+
+    // Texture Parameters
+    // GL_REPEAT ensures correct tiling!
+    GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+    return texID;
+}
 
 int main(int argc, char* argv[]) {
     SDL_Init(SDL_INIT_VIDEO);
@@ -33,7 +85,7 @@ int main(int argc, char* argv[]) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 
-    SDL_Window* window = SDL_CreateWindow("Voxel Game - Packed & Optimized", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    SDL_Window* window = SDL_CreateWindow("Voxel Game - Texture Arrays", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     SDL_GLContext context = SDL_GL_CreateContext(window);
     
     GL::LoadFunctions();
@@ -54,13 +106,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Mesh Chunks (Store separately now!)
+    // Mesh
     std::vector<ChunkRenderData> renderChunks;
-
     for (int cx = -1; cx <= 1; ++cx) {
         for (int cz = -1; cz <= 1; ++cz) {
             VoxelChunk* chunk = world.getChunk(cx, cz);
-            
             MeshingContext ctx;
             ctx.center = chunk;
             ctx.neighbors[0] = world.getChunk(cx + 1, cz);
@@ -72,23 +122,11 @@ int main(int argc, char* argv[]) {
 
             std::vector<Quad> quads = GenerateQuads(ctx);
             std::vector<PackedVertex> verts = Triangulate(quads);
-            
-            if(!verts.empty()) {
-                renderChunks.push_back({verts, cx, cz});
-            }
+            if(!verts.empty()) renderChunks.push_back({verts, cx, cz});
         }
     }
 
-    std::cout << "Chunks to render: " << renderChunks.size() << std::endl;
-
-    // Create Buffers for EACH chunk or one big buffer? 
-    // Let's use one big buffer but keep offsets, OR simplest: Just re-upload everything for this demo.
-    // For optimization, we will put ALL vertices into one VBO.
-    
     std::vector<PackedVertex> allVertices;
-    std::vector<int> chunkOffsets;
-    std::vector<int> chunkCounts;
-    // We also need to store the World Position for each chunk to pass as Uniform.
     struct DrawCmd { int start; int count; float wx; float wz; };
     std::vector<DrawCmd> drawCmds;
 
@@ -110,17 +148,19 @@ int main(int argc, char* argv[]) {
     GL::glBindBuffer(GL_ARRAY_BUFFER, VBO);
     GL::glBufferData(GL_ARRAY_BUFFER, allVertices.size() * sizeof(PackedVertex), allVertices.data(), GL_STATIC_DRAW);
 
-    // IMPORTANT: glVertexAttribIPointer for INTEGERS!
-    // Loc 0: Pos (uint32)
     GL::glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, sizeof(PackedVertex), (void*)0);
     GL::glEnableVertexAttribArray(0);
-    
-    // Loc 1: Attr (uint32)
     GL::glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, sizeof(PackedVertex), (void*)(sizeof(uint32_t)));
     GL::glEnableVertexAttribArray(1);
 
     GLuint prog = CreateProgram("src/shaders/voxel.vert.glsl", "src/shaders/voxel.frag.glsl");
     GL::glUseProgram(prog);
+
+    // Create Palette (Texture Array)
+    GLuint texArrayID = CreatePaletteTextureArray();
+    glActiveTexture(GL_TEXTURE0);
+    GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texArrayID);
+    GL::glUniform1i(GL::glGetUniformLocation(prog, "u_textureArray"), 0);
 
     float camX = 16.0f, camY = 40.0f, camZ = 60.0f;
     float yaw = -90.0f, pitch = -30.0f;
@@ -167,52 +207,32 @@ int main(int argc, char* argv[]) {
         SDL_GetWindowSizeInPixels(window, &w, &h);
         glViewport(0,0,w,h);
         
-        glClearColor(0.2f, 0.2f, 0.2f, 1.0f); 
+        glClearColor(0.5f, 0.7f, 1.0f, 1.0f); 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         
-        // ENABLE CULL FACE NOW!
         glEnable(GL_DEPTH_TEST);
-        glEnable(GL_CULL_FACE);  // Відсікання задніх граней
-        glCullFace(GL_BACK);     // Відсікаємо задні
-        glFrontFace(GL_CCW);     // Проти годинникової стрілки - це перед
+        glEnable(GL_CULL_FACE);  
+        glCullFace(GL_BACK);     
+        glFrontFace(GL_CCW);     
 
         Mat4 model = Identity();
         Mat4 view = LookAt({camX, camY, camZ}, {camX+front.x, camY+front.y, camZ+front.z}, {0,1,0});
         Mat4 proj = Perspective(1.047f, (float)w/h, 0.1f, 1000.0f); 
 
-        // Model matrix is Identity now, we use u_chunkPos for translation
         GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_model"), 1, GL_FALSE, model.m);
         GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_view"), 1, GL_FALSE, view.m);
         GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_proj"), 1, GL_FALSE, proj.m);
 
         GL::glBindVertexArray(VAO);
-        
-        GLint chunkPosLoc = GL::glGetUniformLocation(prog, "u_chunkPos");
+        glActiveTexture(GL_TEXTURE0);
+        GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texArrayID);
 
-        // Draw each chunk with its own offset
         for(const auto& cmd : drawCmds) {
-            // Set uniform for this chunk
-            // NOTE: glUniform3f is usually available, we might need to load it or use struct
-            // For now, let's just hack it: We assume glUniform3f IS loaded or use glUniform4f/vec4 or modify loader.
-            // Wait, we didn't load glUniform3f in GL.cppm! 
-            // Let's create a quick translate matrix or just add the offset in shader via a vec3 uniform.
-            // Since we didn't expose glUniform3f, let's assume we can add it or use a workaround.
-            // Workaround: We can't easily pass vec3 without loading the function.
-            // Let's modify GL.cppm to load glUniform3f really quick OR pass it via Model Matrix.
-            
-            // Method A: Update Model Matrix per chunk
             Mat4 chunkModel = Identity();
             chunkModel.m[12] = cmd.wx;
             chunkModel.m[13] = 0;
             chunkModel.m[14] = cmd.wz;
             GL::glUniformMatrix4fv(GL::glGetUniformLocation(prog, "u_model"), 1, GL_FALSE, chunkModel.m);
-            
-            // Reset u_chunkPos in shader to 0 (since we use matrix now)
-            // Actually, shader adds u_chunkPos. Let's just rely on Model Matrix!
-            // We need to change Shader to remove u_chunkPos or set it to 0. 
-            // Since we can't easily set vec3 uniform without loading the function...
-            // Let's check GL.cppm... NO glUniform3f.
-            // OK, we will use the Model Matrix approach which we already have loaded.
             
             glDrawArrays(GL_TRIANGLES, cmd.start, cmd.count);
         }
