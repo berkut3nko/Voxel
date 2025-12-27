@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(ShaderPlayGround LANGUAGES CXX)
+project(VoxelGame LANGUAGES CXX)
 
 if(POLICY CMP0135)
     cmake_policy(SET CMP0135 NEW)
@@ -13,9 +13,6 @@ set(CMAKE_EXPERIMENTAL_CXX_MODULE_DYNDEP ON)
 if(NOT CMAKE_CXX_COMPILER)
     set(CMAKE_CXX_COMPILER $ENV{CXX})
 endif()
-if(NOT CMAKE_C_COMPILER)
-    set(CMAKE_C_COMPILER $ENV{CC})
-endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,13 +22,8 @@ set(BUILD_SHARED_LIBS OFF)
 
 # --- Dependencies ---
 include(FetchContent)
-set(FETCHCONTENT_BASE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/deps_cache)
-set(FETCHCONTENT_QUIET OFF)
-
-# [cite_start]1. Знаходимо системний OpenGL [cite: 3]
 find_package(OpenGL REQUIRED)
 
-# 2. SDL3
 FetchContent_Declare(
     SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
@@ -39,41 +31,42 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
     FIND_PACKAGE_ARGS COMPONENTS SDL3-static 
 )
-
-message(STATUS "=== Fetching SDL3 ===")
 FetchContent_MakeAvailable(SDL3)
 
-message(STATUS "=== All dependencies fetched! ===")
-
-
-# --- MAIN EXECUTABLE ---
-add_executable(ShaderPlayGround
+# --- Main Executable ---
+add_executable(VoxelGame
     src/main.cpp
 )
-target_include_directories(ShaderPlayGround
+
+# --- Modules ---
+target_sources(VoxelGame
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders
-    PRIVATE
-        ${CMAKE_BINARY_DIR}
+        FILE_SET CXX_MODULES FILES
+            src/modules/Types.cppm
+            src/modules/Math.cppm
+            src/modules/GL.cppm
+            src/modules/Shader.cppm
+            src/modules/World.cppm
+            src/modules/Meshing.cppm
 )
 
-# [cite_start]3. Лінкуємо OpenGL::GL разом з SDL3 [cite: 3]
-target_link_libraries(ShaderPlayGround
+target_include_directories(VoxelGame
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders
+)
+
+target_link_libraries(VoxelGame
     PUBLIC
         SDL3::SDL3-static
         OpenGL::GL
 )
 
+# Copy shaders
 set(SHADER_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders")
-set(SHADER_DEST_DIR "$<TARGET_FILE_DIR:ShaderPlayGround>/src/shaders")
-
+set(SHADER_DEST_DIR "$<TARGET_FILE_DIR:VoxelGame>/src/shaders")
 add_custom_command(
-    TARGET ShaderPlayGround POST_BUILD
+    TARGET VoxelGame POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DEST_DIR}
     COMMAND ${CMAKE_COMMAND} -E copy_directory ${SHADER_SRC_DIR} ${SHADER_DEST_DIR}
     COMMENT "Copying shaders to build directory"
 )
-
-if(WIN32)
-    set_property(TARGET ShaderPlayGround PROPERTY WIN32_EXECUTABLE TRUE)
-endif()

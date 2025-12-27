@@ -2,4 +2,4 @@ cmake -B build -S . -G Ninja -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=cl
 
 cmake --build build
 
-./build/ShaderPlayGround
+./build/VoxelGame
