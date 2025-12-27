@@ -31,7 +31,7 @@ struct ChunkRenderData {
 
 struct GpuChunkInfo {
     int x, z;
-    unsigned int quadStart; // Offset in GpuQuad buffer
+    unsigned int quadStart;
     int pad;
 };
 
@@ -59,23 +59,31 @@ GLuint CreatePaletteTextureArray() {
     return texID;
 }
 
+// Виправлений профайлер з високою точністю
 struct Profiler {
     using Clock = std::chrono::high_resolution_clock;
     std::chrono::time_point<Clock> start;
     void begin() { start = Clock::now(); }
     double end() { 
-        return std::chrono::duration<double, std::milli>(Clock::now() - start).count(); 
+        auto dur = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start);
+        return dur.count() / 1000.0; 
     }
 };
 
 int main(int argc, char* argv[]) {
     SDL_Init(SDL_INIT_VIDEO);
+    
+    // OpenGL 4.5
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 6);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_Window* window = SDL_CreateWindow("Voxel Game - MultiDrawElements Indirect", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    
+    SDL_Window* window = SDL_CreateWindow("Voxel Game - MultiDrawElements", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     SDL_GLContext context = SDL_GL_CreateContext(window);
+    
+    // VSync OFF для тесту продуктивності
     SDL_GL_SetSwapInterval(0);
+    
     GL::LoadFunctions();
     
     bool mouseCaptured = true;
@@ -83,7 +91,9 @@ int main(int argc, char* argv[]) {
 
     WorldManager world;
     int seed = std::time(nullptr) % 1000;
-    int range = 3;
+    int range = 1;
+    
+    std::cout << "Generating chunks..." << std::endl;
     for (int cx = -range; cx <= range; ++cx) {
         for (int cz = -range; cz <= range; ++cz) {
             VoxelChunk& chunk = world.createChunk(cx, cz);
@@ -91,6 +101,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    std::cout << "Meshing chunks..." << std::endl;
     std::vector<ChunkRenderData> renderChunks;
     for (int cx = -range; cx <= range; ++cx) {
         for (int cz = -range; cz <= range; ++cz) {
@@ -110,8 +121,11 @@ int main(int argc, char* argv[]) {
             if(!gpuQ.empty()) renderChunks.push_back({gpuQ, cx, cz});
         }
     }
+    
+    if (renderChunks.empty()) {
+        std::cerr << "WARNING: No geometry generated!" << std::endl;
+    }
 
-    // 1. Prepare Data
     std::vector<GpuQuad> allGpuQuads;
     std::vector<GL::DrawElementsIndirectCommand> commands;
     std::vector<GpuChunkInfo> chunkInfos;
@@ -120,32 +134,40 @@ int main(int argc, char* argv[]) {
         const auto& rc = renderChunks[i];
         
         GL::DrawElementsIndirectCommand cmd;
-        cmd.count = 6; // Draw 1 Quad (2 triangles) -> 6 indices
-        cmd.instanceCount = rc.gpuQuads.size(); // N Quads (Instances)
+        cmd.count = 6; 
+        cmd.instanceCount = rc.gpuQuads.size(); 
         cmd.firstIndex = 0;
         cmd.baseVertex = 0;
-        cmd.baseInstance = i; // Index in ChunkInfoBuffer
+        cmd.baseInstance = i; 
         
         commands.push_back(cmd);
         
         chunkInfos.push_back({
             rc.chunkX * CHUNK_SIZE, 
             rc.chunkZ * CHUNK_SIZE, 
-            (unsigned int)allGpuQuads.size(), // quadStart
+            (unsigned int)allGpuQuads.size(), 
             0
         });
 
         allGpuQuads.insert(allGpuQuads.end(), rc.gpuQuads.begin(), rc.gpuQuads.end());
     }
 
-    // 2. Create Static IBO (0,1,2, 0,2,3)
+    // 1. VAO & IBO setup
+    GLuint emptyVAO;
+    GL::glGenVertexArrays(1, &emptyVAO);
+    GL::glBindVertexArray(emptyVAO); // Bind VAO first!
+
+    // Create Static IBO (0,1,2, 0,2,3)
     GLuint indices[] = {0, 1, 2, 0, 2, 3};
     GLuint ibo;
     GL::glGenBuffers(1, &ibo);
-    GL::glBindBuffer(0x8893, ibo); // GL_ELEMENT_ARRAY_BUFFER
+    GL::glBindBuffer(0x8893, ibo); // GL_ELEMENT_ARRAY_BUFFER to CURRENT VAO
     GL::glBufferData(0x8893, sizeof(indices), indices, GL_STATIC_DRAW);
+    
+    // Unbind VAO to prevents accidental modification
+    GL::glBindVertexArray(0);
 
-    // 3. Buffers
+    // 2. SSBO Buffers
     GLuint ssboQuads, ssboChunks, indirectBuffer;
     GL::glGenBuffers(1, &ssboQuads);
     GL::glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboQuads);
@@ -161,10 +183,14 @@ int main(int argc, char* argv[]) {
     GL::glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirectBuffer);
     GL::glBufferData(GL_DRAW_INDIRECT_BUFFER, commands.size() * sizeof(GL::DrawElementsIndirectCommand), commands.data(), GL_STATIC_DRAW);
 
-    GLuint emptyVAO;
-    GL::glGenVertexArrays(1, &emptyVAO);
-
     ShaderProgram shader = CreateProgram("src/shaders/voxel.vert.glsl", "src/shaders/voxel.frag.glsl");
+    
+    // !!! CRITICAL CHECK !!!
+    if (shader.id == 0) {
+        std::cerr << "FATAL: Shader compilation failed. Exiting." << std::endl;
+        return -1;
+    }
+    
     GL::glUseProgram(shader.id);
 
     GLuint texArrayID = CreatePaletteTextureArray();
@@ -213,9 +239,13 @@ int main(int argc, char* argv[]) {
 
         renderTimer.begin();
         int w, h; SDL_GetWindowSizeInPixels(window, &w, &h); glViewport(0,0,w,h);
-        glClearColor(0.5f, 0.7f, 1.0f, 1.0f); 
+        glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Темний фон, щоб бачити, чи працює очистка
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        glEnable(GL_DEPTH_TEST); glEnable(GL_CULL_FACE); glCullFace(GL_BACK); glFrontFace(GL_CCW);
+        
+        glEnable(GL_DEPTH_TEST); 
+        glEnable(GL_CULL_FACE); 
+        glCullFace(GL_BACK); 
+        glFrontFace(GL_CCW);
 
         Mat4 view = LookAt({camX, camY, camZ}, {camX+front.x, camY+front.y, camZ+front.z}, {0,1,0});
         Mat4 proj = Perspective(1.047f, (float)w/h, 0.1f, 1000.0f); 
@@ -224,23 +254,26 @@ int main(int argc, char* argv[]) {
         GL::glUniformMatrix4fv(shader.loc_proj, 1, GL_FALSE, proj.m);
         GL::glUniform1i(shader.loc_showGrid, showGrid ? 1 : 0);
 
-        GL::glBindVertexArray(emptyVAO);
-        GL::glBindBuffer(0x8893, ibo); 
+        GL::glBindVertexArray(emptyVAO); // VAO вже має IBO
         GL::glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirectBuffer);
         
-        // MultiDrawElementsIndirect: Draw N instances of 6 indices
         GL::glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, (GLsizei)commands.size(), 0);
 
         SDL_GL_SwapWindow(window);
         renderTimeMs = renderTimer.end();
         
-        acc += frameTimer.end();
+        double currentFrameTime = frameTimer.end();
+        acc += currentFrameTime;
         frames++;
+        
         if (acc >= 500.0) {
             double avg = acc / frames;
+            // Уникаємо ділення на нуль
+            double fps = (avg > 0.0001) ? 1000.0 / avg : 9999.0;
+            
             std::stringstream ss;
-            ss << "Voxel Engine (MultiDraw Indirect) | " << std::fixed << std::setprecision(1) << 1000.0/avg << " FPS | "
-               << std::setprecision(2) << avg << "ms | "
+            ss << "Voxel Engine | " << std::fixed << std::setprecision(1) << fps << " FPS | "
+               << std::setprecision(3) << avg << "ms | "
                << "L:" << logicTimeMs << " R:" << renderTimeMs;
             SDL_SetWindowTitle(window, ss.str().c_str());
             acc = 0; frames = 0;

@@ -9,10 +9,10 @@ export namespace VoxelGame::GL {
     typedef void (APIENTRY *PFN_GLGENBUFFERS) (GLsizei n, GLuint *buffers);
     typedef void (APIENTRY *PFN_GLBINDBUFFER) (GLenum target, GLuint buffer);
     typedef void (APIENTRY *PFN_GLBUFFERDATA) (GLenum target, GLsizeiptr size, const void *data, GLenum usage);
+    typedef void (APIENTRY *PFN_GLBUFFERSUBDATA) (GLenum target, GLintptr offset, GLsizeiptr size, const void *data);
     typedef void (APIENTRY *PFN_GLENABLEVERTEXATTRIBARRAY) (GLuint index);
     typedef void (APIENTRY *PFN_GLVERTEXATTRIBPOINTER) (GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer);
     typedef void (APIENTRY *PFN_GLVERTEXATTRIBIPOINTER) (GLuint index, GLint size, GLenum type, GLsizei stride, const void *pointer);
-    
     typedef GLuint (APIENTRY *PFN_GLCREATESHADER) (GLenum type);
     typedef void (APIENTRY *PFN_GLSHADERSOURCE) (GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length);
     typedef void (APIENTRY *PFN_GLCOMPILESHADER) (GLuint shader);
@@ -27,17 +27,15 @@ export namespace VoxelGame::GL {
     typedef GLint (APIENTRY *PFN_GLGETUNIFORMLOCATION) (GLuint program, const GLchar *name);
     typedef void (APIENTRY *PFN_GLUNIFORM1I) (GLint location, GLint v0);
     typedef void (APIENTRY *PFN_GLUNIFORMMATRIX4FV) (GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
-    
     typedef void (APIENTRY *PFN_GLGENTEXTURES) (GLsizei n, GLuint *textures);
     typedef void (APIENTRY *PFN_GLBINDTEXTURE) (GLenum target, GLuint texture);
     typedef void (APIENTRY *PFN_GLTEXIMAGE2D) (GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels);
     typedef void (APIENTRY *PFN_GLTEXIMAGE3D) (GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels);
     typedef void (APIENTRY *PFN_GLTEXSUBIMAGE3D) (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels);
     typedef void (APIENTRY *PFN_GLTEXPARAMETERI) (GLenum target, GLenum pname, GLint param);
-
     #define GL_SHADER_STORAGE_BUFFER 0x90D2
     typedef void (APIENTRY *PFN_GLBINDBUFFERBASE) (GLenum target, GLuint index, GLuint buffer);
-
+    
     // Indirect Draw
     #define GL_DRAW_INDIRECT_BUFFER 0x8F3F
     
@@ -47,7 +45,6 @@ export namespace VoxelGame::GL {
         GLuint  first;
         GLuint  baseInstance;
     };
-
     struct DrawElementsIndirectCommand {
         GLuint  count;
         GLuint  instanceCount;
@@ -65,6 +62,7 @@ export namespace VoxelGame::GL {
     PFN_GLGENBUFFERS glGenBuffers;
     PFN_GLBINDBUFFER glBindBuffer;
     PFN_GLBUFFERDATA glBufferData;
+    PFN_GLBUFFERSUBDATA glBufferSubData;
     PFN_GLENABLEVERTEXATTRIBARRAY glEnableVertexAttribArray;
     PFN_GLVERTEXATTRIBPOINTER glVertexAttribPointer;
     PFN_GLVERTEXATTRIBIPOINTER glVertexAttribIPointer;
@@ -100,6 +98,7 @@ export namespace VoxelGame::GL {
         glGenBuffers = (PFN_GLGENBUFFERS)SDL_GL_GetProcAddress("glGenBuffers");
         glBindBuffer = (PFN_GLBINDBUFFER)SDL_GL_GetProcAddress("glBindBuffer");
         glBufferData = (PFN_GLBUFFERDATA)SDL_GL_GetProcAddress("glBufferData");
+        glBufferSubData = (PFN_GLBUFFERSUBDATA)SDL_GL_GetProcAddress("glBufferSubData");
         glEnableVertexAttribArray = (PFN_GLENABLEVERTEXATTRIBARRAY)SDL_GL_GetProcAddress("glEnableVertexAttribArray");
         glVertexAttribPointer = (PFN_GLVERTEXATTRIBPOINTER)SDL_GL_GetProcAddress("glVertexAttribPointer");
         glVertexAttribIPointer = (PFN_GLVERTEXATTRIBIPOINTER)SDL_GL_GetProcAddress("glVertexAttribIPointer");
