@@ -5,39 +5,19 @@ out vec4 FragColor;
 in vec3 v_pos;
 in vec3 v_normal;
 in float v_type;
+in vec3 v_color; // NEW
 
 uniform sampler2D u_texture;
 
 void main() {
-    // 1. Визначаємо базові UV
-    vec2 uv;
-    if (abs(v_normal.x) > 0.5) {
-        uv = v_pos.yz;
-    } else if (abs(v_normal.y) > 0.5) {
-        uv = v_pos.xz;
-    } else {
-        uv = v_pos.xy;
-    }
+    // Просте дифузне освітлення, щоб бачити грані
+    vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
+    float diff = max(dot(v_normal, lightDir), 0.3); // 0.3 - ambient
 
-    // 2. Отримуємо дробову частину (0..1)
-    uv = fract(uv);
+    // Використовуємо випадковий колір замість текстури
+    vec3 finalColor = v_color * diff;
 
-    // 3. FIX ARTIFACTS: Стискаємо UV, щоб не брати пікселі з сусіднього тайлу
-    // Замість 0.0...1.0 беремо 0.01...0.99
-    // Це запобігає "кровоточенню" текстури (bleeding)
-    float padding = 0.02;
-    uv = uv * (1.0 - 2.0 * padding) + padding;
-
-    // 4. Масштабуємо для атласу (у нас 2 тайли по горизонталі)
-    // Ширина одного тайлу = 0.5
-    uv.x *= 0.5;
-
-    // 5. Зміщення для типу блоку
-    if (v_type > 1.5) { // Dirt
-        uv.x += 0.5;
-    } else {            // Grass
-        uv.x += 0.0;
-    }
-
-    FragColor = texture(u_texture, uv);
+    // Додаємо легку обводку (за бажанням, але для greedy meshing і так буде видно)
+    // Просто виводимо колір
+    FragColor = vec4(finalColor, 1.0);
 }

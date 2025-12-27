@@ -1,5 +1,6 @@
 module;
 #include <vector>
+#include <map>
 #include <cmath>
 #include <algorithm>
 #include <tuple>
@@ -15,8 +16,9 @@ export namespace VoxelGame::World {
     // --- Component: Chunk Data ---
     struct VoxelChunk {
         std::vector<VoxelType> voxels;
+        int chunkX, chunkZ; // World coordinates of the chunk
 
-        VoxelChunk() {
+        VoxelChunk(int cx = 0, int cz = 0) : chunkX(cx), chunkZ(cz) {
             voxels.resize(CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE, AIR);
         }
 
@@ -37,6 +39,31 @@ export namespace VoxelGame::World {
         }
     };
 
+    // --- World Container ---
+    struct WorldManager {
+        // Simple map: key = (x, z), value = Chunk
+        // Using a flat map or hashing for simplicity
+        std::map<std::pair<int, int>, VoxelChunk> chunks;
+
+        VoxelChunk* getChunk(int cx, int cz) {
+            auto it = chunks.find({cx, cz});
+            if (it != chunks.end()) {
+                return &it->second;
+            }
+            return nullptr;
+        }
+
+        VoxelChunk& createChunk(int cx, int cz) {
+            // Emplace constructs in place
+            auto [it, inserted] = chunks.try_emplace({cx, cz}, cx, cz);
+            return it->second;
+        }
+        
+        void clear() {
+            chunks.clear();
+        }
+    };
+
     // --- System: Terrain Generation ---
     namespace TerrainSystem {
         float lerp(float a, float b, float t) { return a + t * (b - a); }
@@ -53,16 +80,18 @@ export namespace VoxelGame::World {
             return lerp(lerp(grad(p(X)+Z,x,z), grad(p(X+1)+Z,x-1,z),u), lerp(grad(p(X)+Z+1,x,z-1), grad(p(X+1)+Z+1,x-1,z-1),u),v);
         }
 
-        void Generate(VoxelChunk& chunk, int seed, int chunkX, int chunkZ) {
+        void Generate(VoxelChunk& chunk, int seed) {
             std::fill(chunk.voxels.begin(), chunk.voxels.end(), AIR);
 
             for (int x = 0; x < CHUNK_SIZE; ++x) {
                 for (int z = 0; z < CHUNK_SIZE; ++z) {
-                    float gx = (float)(chunkX * CHUNK_SIZE + x);
-                    float gz = (float)(chunkZ * CHUNK_SIZE + z);
+                    // Global coordinates for smooth noise across chunks
+                    float gx = (float)(chunk.chunkX * CHUNK_SIZE + x);
+                    float gz = (float)(chunk.chunkZ * CHUNK_SIZE + z);
                     
-                    float noiseVal = perlin(gx * 0.15f, gz * 0.15f, seed);
-                    int height = 8 + (int)(noiseVal * 8.0f);
+                    // Lower frequency for wider hills
+                    float noiseVal = perlin(gx * 0.05f, gz * 0.05f, seed);
+                    int height = 10 + (int)(noiseVal * 10.0f);
                     height = std::clamp(height, 1, CHUNK_SIZE - 1);
 
                     for (int y = 0; y <= height; ++y) {
@@ -75,14 +104,11 @@ export namespace VoxelGame::World {
                         }
                     }
                     
-                    if (x > 5 && x < 10 && z == 5 && height < 20) {
-                         for(int ph = 1; ph <= 5; ph++) 
+                    // Simple features relative to chunk logic just for demo
+                    // We disable complex structures spanning chunks for simplicity here
+                    if (height < 20 && (x+z)%15 == 0) {
+                         for(int ph = 1; ph <= 3; ph++) 
                             chunk.set(x, height + ph, z, PILLAR);
-                    }
-
-                    if (z == 20 && x > 10 && x < 25 && height < 20) {
-                        for(int wh = 1; wh <= 3; wh++)
-                            chunk.set(x, height + wh, z, WALL_X);
                     }
                 }
             }
