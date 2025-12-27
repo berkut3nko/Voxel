@@ -4,7 +4,7 @@
 #include <iostream>
 #include <ctime>
 #include <cmath>
-#include <chrono> // Для профайлера
+#include <chrono> 
 #include <string>
 #include <iomanip>
 #include <sstream>
@@ -25,8 +25,14 @@ using namespace VoxelGame::Shader;
 namespace GL = VoxelGame::GL;
 
 struct ChunkRenderData {
-    std::vector<PackedVertex> vertices;
+    std::vector<GpuQuad> gpuQuads;
     int chunkX, chunkZ;
+};
+
+struct GpuChunkInfo {
+    int x, z;
+    unsigned int quadStart; // Offset in GpuQuad buffer
+    int pad;
 };
 
 // --- Palette Generation Helper ---
@@ -34,88 +40,62 @@ GLuint CreatePaletteTextureArray() {
     GLuint texID;
     GL::glGenTextures(1, &texID);
     GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texID);
-
-    int width = 16;
-    int height = 16;
-    int layers = 8; 
-
-    GL::glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGB8, width, height, layers, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-
-    auto FillLayer = [&](int layer, uint8_t r, uint8_t g, uint8_t b) {
-        std::vector<uint8_t> data(width * height * 3);
-        for (int i = 0; i < width * height; ++i) {
-            uint8_t noise = (rand() % 40); 
-            data[i*3+0] = (r > noise) ? r - noise : 0;
-            data[i*3+1] = (g > noise) ? g - noise : 0;
-            data[i*3+2] = (b > noise) ? b - noise : 0;
+    int w=16, h=16, l=8;
+    GL::glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGB8, w, h, l, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    auto Fill = [&](int la, uint8_t r, uint8_t g, uint8_t b) {
+        std::vector<uint8_t> d(w*h*3);
+        for(int i=0; i<w*h; ++i) { 
+            uint8_t n = rand()%40; 
+            d[i*3]=r>n?r-n:0; d[i*3+1]=g>n?g-n:0; d[i*3+2]=b>n?b-n:0; 
         }
-        GL::glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, width, height, 1, GL_RGB, GL_UNSIGNED_BYTE, data.data());
+        GL::glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, la, w, h, 1, GL_RGB, GL_UNSIGNED_BYTE, d.data());
     };
-
-    FillLayer(0, 50, 200, 50);
-    FillLayer(1, 139, 69, 19);
-    FillLayer(2, 240, 240, 255);
-    FillLayer(3, 50, 50, 50);
-    FillLayer(4, 100, 100, 255);
-    FillLayer(5, 200, 80, 80);
-    FillLayer(6, 128, 128, 128);
-
+    Fill(0,50,200,50); Fill(1,139,69,19); Fill(2,240,240,255); Fill(3,50,50,50);
+    Fill(4,100,100,255); Fill(5,200,80,80); Fill(6,128,128,128);
     GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
     GL::glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT);
-
     return texID;
 }
 
-// Простий клас таймера
 struct Profiler {
     using Clock = std::chrono::high_resolution_clock;
     std::chrono::time_point<Clock> start;
-    
     void begin() { start = Clock::now(); }
-    
-    double end() { // Повертає мс
-        auto now = Clock::now();
-        std::chrono::duration<double, std::milli> diff = now - start;
-        return diff.count();
+    double end() { 
+        return std::chrono::duration<double, std::milli>(Clock::now() - start).count(); 
     }
 };
 
 int main(int argc, char* argv[]) {
     SDL_Init(SDL_INIT_VIDEO);
-    
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 6);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-
-    SDL_Window* window = SDL_CreateWindow("Voxel Game", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    SDL_Window* window = SDL_CreateWindow("Voxel Game - MultiDrawElements Indirect", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     SDL_GLContext context = SDL_GL_CreateContext(window);
-    // Вимикаємо V-Sync для тестування максимального FPS
-    SDL_GL_SetSwapInterval(0); 
-    
+    SDL_GL_SetSwapInterval(0);
     GL::LoadFunctions();
     
     bool mouseCaptured = true;
-    if (!SDL_SetWindowRelativeMouseMode(window, true)) {
-        mouseCaptured = false;
-    }
+    SDL_SetWindowRelativeMouseMode(window, true);
 
     WorldManager world;
     int seed = std::time(nullptr) % 1000;
-    
-    // --- Початкова генерація ---
-    for (int cx = -1; cx <= 1; ++cx) {
-        for (int cz = -1; cz <= 1; ++cz) {
+    int range = 3;
+    for (int cx = -range; cx <= range; ++cx) {
+        for (int cz = -range; cz <= range; ++cz) {
             VoxelChunk& chunk = world.createChunk(cx, cz);
             TerrainSystem::Generate(chunk, seed);
         }
     }
 
     std::vector<ChunkRenderData> renderChunks;
-    for (int cx = -1; cx <= 1; ++cx) {
-        for (int cz = -1; cz <= 1; ++cz) {
+    for (int cx = -range; cx <= range; ++cx) {
+        for (int cz = -range; cz <= range; ++cz) {
             VoxelChunk* chunk = world.getChunk(cx, cz);
+            if(!chunk) continue;
             MeshingContext ctx;
             ctx.center = chunk;
             ctx.neighbors[0] = world.getChunk(cx + 1, cz);
@@ -126,184 +106,144 @@ int main(int argc, char* argv[]) {
             ctx.neighbors[5] = world.getChunk(cx, cz - 1);
 
             std::vector<Quad> quads = GenerateQuads(ctx);
-            std::vector<PackedVertex> verts = Triangulate(quads);
-            if(!verts.empty()) renderChunks.push_back({verts, cx, cz});
+            std::vector<GpuQuad> gpuQ = BuildSSBOData(quads);
+            if(!gpuQ.empty()) renderChunks.push_back({gpuQ, cx, cz});
         }
     }
 
-    std::vector<PackedVertex> allVertices;
-    struct DrawCmd { int start; int count; float wx; float wz; };
-    std::vector<DrawCmd> drawCmds;
+    // 1. Prepare Data
+    std::vector<GpuQuad> allGpuQuads;
+    std::vector<GL::DrawElementsIndirectCommand> commands;
+    std::vector<GpuChunkInfo> chunkInfos;
 
-    for(const auto& rc : renderChunks) {
-        DrawCmd cmd;
-        cmd.start = allVertices.size();
-        cmd.count = rc.vertices.size();
-        cmd.wx = (float)(rc.chunkX * CHUNK_SIZE);
-        cmd.wz = (float)(rc.chunkZ * CHUNK_SIZE);
+    for(size_t i=0; i<renderChunks.size(); ++i) {
+        const auto& rc = renderChunks[i];
         
-        allVertices.insert(allVertices.end(), rc.vertices.begin(), rc.vertices.end());
-        drawCmds.push_back(cmd);
+        GL::DrawElementsIndirectCommand cmd;
+        cmd.count = 6; // Draw 1 Quad (2 triangles) -> 6 indices
+        cmd.instanceCount = rc.gpuQuads.size(); // N Quads (Instances)
+        cmd.firstIndex = 0;
+        cmd.baseVertex = 0;
+        cmd.baseInstance = i; // Index in ChunkInfoBuffer
+        
+        commands.push_back(cmd);
+        
+        chunkInfos.push_back({
+            rc.chunkX * CHUNK_SIZE, 
+            rc.chunkZ * CHUNK_SIZE, 
+            (unsigned int)allGpuQuads.size(), // quadStart
+            0
+        });
+
+        allGpuQuads.insert(allGpuQuads.end(), rc.gpuQuads.begin(), rc.gpuQuads.end());
     }
 
-    GLuint VAO, VBO;
-    GL::glGenVertexArrays(1, &VAO);
-    GL::glGenBuffers(1, &VBO);
-    GL::glBindVertexArray(VAO);
-    GL::glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    GL::glBufferData(GL_ARRAY_BUFFER, allVertices.size() * sizeof(PackedVertex), allVertices.data(), GL_STATIC_DRAW);
+    // 2. Create Static IBO (0,1,2, 0,2,3)
+    GLuint indices[] = {0, 1, 2, 0, 2, 3};
+    GLuint ibo;
+    GL::glGenBuffers(1, &ibo);
+    GL::glBindBuffer(0x8893, ibo); // GL_ELEMENT_ARRAY_BUFFER
+    GL::glBufferData(0x8893, sizeof(indices), indices, GL_STATIC_DRAW);
 
-    GLsizei stride = sizeof(PackedVertex); // 12 bytes
-    
-    // Loc 0: PackedPos (uint) -> Offset 0
-    GL::glVertexAttribIPointer(0, 1, GL_UNSIGNED_INT, stride, (void*)0);
-    GL::glEnableVertexAttribArray(0);
-    
-    // Loc 1: PackedAttr (uint) -> Offset 4
-    GL::glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, stride, (void*)(sizeof(uint32_t)));
-    GL::glEnableVertexAttribArray(1);
+    // 3. Buffers
+    GLuint ssboQuads, ssboChunks, indirectBuffer;
+    GL::glGenBuffers(1, &ssboQuads);
+    GL::glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboQuads);
+    GL::glBufferData(GL_SHADER_STORAGE_BUFFER, allGpuQuads.size() * sizeof(GpuQuad), allGpuQuads.data(), GL_STATIC_DRAW);
+    GL::glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboQuads);
 
-    // Loc 2: PackedUV (uint) -> Offset 8
-    GL::glVertexAttribIPointer(2, 1, GL_UNSIGNED_INT, stride, (void*)(2 * sizeof(uint32_t)));
-    GL::glEnableVertexAttribArray(2);
+    GL::glGenBuffers(1, &ssboChunks);
+    GL::glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboChunks);
+    GL::glBufferData(GL_SHADER_STORAGE_BUFFER, chunkInfos.size() * sizeof(GpuChunkInfo), chunkInfos.data(), GL_STATIC_DRAW);
+    GL::glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboChunks);
 
-    // Тепер це структура ShaderProgram
+    GL::glGenBuffers(1, &indirectBuffer);
+    GL::glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirectBuffer);
+    GL::glBufferData(GL_DRAW_INDIRECT_BUFFER, commands.size() * sizeof(GL::DrawElementsIndirectCommand), commands.data(), GL_STATIC_DRAW);
+
+    GLuint emptyVAO;
+    GL::glGenVertexArrays(1, &emptyVAO);
+
     ShaderProgram shader = CreateProgram("src/shaders/voxel.vert.glsl", "src/shaders/voxel.frag.glsl");
     GL::glUseProgram(shader.id);
 
     GLuint texArrayID = CreatePaletteTextureArray();
     glActiveTexture(GL_TEXTURE0);
     GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texArrayID);
-    // Використовуємо кешовану локацію
     GL::glUniform1i(shader.loc_textureArray, 0);
 
-    float camX = 16.0f, camY = 40.0f, camZ = 60.0f;
+    float camX = 0.0f, camY = 40.0f, camZ = 0.0f;
     float yaw = -90.0f, pitch = -30.0f;
-    bool showGrid = false; 
+    bool showGrid = false;
 
-    // --- Profiler Variables ---
     Profiler frameTimer, logicTimer, renderTimer;
-    double logicTimeMs = 0.0;
-    double renderTimeMs = 0.0;
-    double totalFrameTimeMs = 0.0;
-    int frameCount = 0;
-    double timeAccumulator = 0.0; // Для оновлення заголовка раз на 1с
+    double logicTimeMs=0, renderTimeMs=0, acc=0;
+    int frames=0;
 
     bool running = true;
     while(running) {
-        frameTimer.begin(); // START FRAME
-
-        // --- 1. Input & Logic ---
+        frameTimer.begin();
         logicTimer.begin();
         SDL_Event ev;
         while(SDL_PollEvent(&ev)) {
-            if(ev.type == SDL_EVENT_QUIT) running = false;
-            
-            if(ev.type == SDL_EVENT_KEY_DOWN) {
-                if (ev.key.key == SDLK_ESCAPE) {
-                    mouseCaptured = false;
-                    SDL_SetWindowRelativeMouseMode(window, false);
-                }
-                if (ev.key.key == SDLK_G) { 
-                    showGrid = !showGrid;
-                }
-                // Regenerate on R (Demo logic overhead)
-                if (ev.key.key == SDLK_R) {
-                    // Simple rebuild logic (can be slow, but useful to profile)
-                    // ... (re-generate code omitted for brevity as it's static in loop for now) ...
-                }
-            }
-            if(ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !mouseCaptured) {
-                mouseCaptured = true;
-                SDL_SetWindowRelativeMouseMode(window, true);
-            }
-            if(ev.type == SDL_EVENT_MOUSE_MOTION && mouseCaptured) {
-                yaw += ev.motion.xrel * 0.1f;
-                pitch -= ev.motion.yrel * 0.1f;
-                if(pitch > 89.0f) pitch = 89.0f;
-                if(pitch < -89.0f) pitch = -89.0f;
-            }
+             if(ev.type == SDL_EVENT_QUIT) running = false;
+             if(ev.type == SDL_EVENT_KEY_DOWN) {
+                 if (ev.key.key == SDLK_ESCAPE) { mouseCaptured = false; SDL_SetWindowRelativeMouseMode(window, false); }
+                 if (ev.key.key == SDLK_G) showGrid = !showGrid;
+             }
+             if(ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) { mouseCaptured = true; SDL_SetWindowRelativeMouseMode(window, true); }
+             if(ev.type == SDL_EVENT_MOUSE_MOTION && mouseCaptured) {
+                 yaw += ev.motion.xrel * 0.1f; pitch -= ev.motion.yrel * 0.1f;
+                 if(pitch > 89.0f) pitch = 89.0f; if(pitch < -89.0f) pitch = -89.0f;
+             }
         }
-
         float radYaw = yaw * 0.0174533f;
         float radPitch = pitch * 0.0174533f;
         Vec3 front = { std::cos(radYaw)*std::cos(radPitch), std::sin(radPitch), std::sin(radYaw)*std::cos(radPitch) };
         front = Normalize(front);
         Vec3 right = Normalize(Cross(front, {0,1,0}));
-
         const bool* keys = SDL_GetKeyboardState(nullptr);
-        float speed = 0.5f; // Per frame speed (should use delta time)
+        float speed = 0.5f;
         if(keys[SDL_SCANCODE_LSHIFT]) speed = 1.5f;
         if(keys[SDL_SCANCODE_W]) { camX += front.x*speed; camY += front.y*speed; camZ += front.z*speed; }
         if(keys[SDL_SCANCODE_S]) { camX -= front.x*speed; camY -= front.y*speed; camZ -= front.z*speed; }
         if(keys[SDL_SCANCODE_A]) { camX -= right.x*speed; camY -= right.y*speed; camZ -= right.z*speed; }
         if(keys[SDL_SCANCODE_D]) { camX += right.x*speed; camY += right.y*speed; camZ += right.z*speed; }
-        
         logicTimeMs = logicTimer.end();
 
-        // --- 2. Render ---
         renderTimer.begin();
-        
-        int w, h; 
-        SDL_GetWindowSizeInPixels(window, &w, &h);
-        glViewport(0,0,w,h);
-        
+        int w, h; SDL_GetWindowSizeInPixels(window, &w, &h); glViewport(0,0,w,h);
         glClearColor(0.5f, 0.7f, 1.0f, 1.0f); 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        
-        glEnable(GL_DEPTH_TEST);
-        glEnable(GL_CULL_FACE);  
-        glCullFace(GL_BACK);     
-        glFrontFace(GL_CCW);     
+        glEnable(GL_DEPTH_TEST); glEnable(GL_CULL_FACE); glCullFace(GL_BACK); glFrontFace(GL_CCW);
 
-        Mat4 model = Identity();
         Mat4 view = LookAt({camX, camY, camZ}, {camX+front.x, camY+front.y, camZ+front.z}, {0,1,0});
         Mat4 proj = Perspective(1.047f, (float)w/h, 0.1f, 1000.0f); 
 
-        // Використовуємо кешовані локації
-        GL::glUniformMatrix4fv(shader.loc_model, 1, GL_FALSE, model.m);
         GL::glUniformMatrix4fv(shader.loc_view, 1, GL_FALSE, view.m);
         GL::glUniformMatrix4fv(shader.loc_proj, 1, GL_FALSE, proj.m);
         GL::glUniform1i(shader.loc_showGrid, showGrid ? 1 : 0);
 
-        GL::glBindVertexArray(VAO);
-        glActiveTexture(GL_TEXTURE0);
-        GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texArrayID);
-
-        for(const auto& cmd : drawCmds) {
-            Mat4 chunkModel = Identity();
-            chunkModel.m[12] = cmd.wx;
-            chunkModel.m[13] = 0;
-            chunkModel.m[14] = cmd.wz;
-            GL::glUniformMatrix4fv(shader.loc_model, 1, GL_FALSE, chunkModel.m);
-            
-            glDrawArrays(GL_TRIANGLES, cmd.start, cmd.count);
-        }
-
-        SDL_GL_SwapWindow(window); // SwapBuffers is part of render/present time
-        renderTimeMs = renderTimer.end();
-
-        totalFrameTimeMs = frameTimer.end(); // END FRAME
-
-        // --- 3. Profiler Title Update (Every ~500ms) ---
-        timeAccumulator += totalFrameTimeMs;
-        frameCount++;
+        GL::glBindVertexArray(emptyVAO);
+        GL::glBindBuffer(0x8893, ibo); 
+        GL::glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirectBuffer);
         
-        if (timeAccumulator >= 500.0) {
-            double avgFrameTime = timeAccumulator / frameCount;
-            double fps = 1000.0 / avgFrameTime;
-            
+        // MultiDrawElementsIndirect: Draw N instances of 6 indices
+        GL::glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, (GLsizei)commands.size(), 0);
+
+        SDL_GL_SwapWindow(window);
+        renderTimeMs = renderTimer.end();
+        
+        acc += frameTimer.end();
+        frames++;
+        if (acc >= 500.0) {
+            double avg = acc / frames;
             std::stringstream ss;
-            ss << "Voxel Engine | "
-               << std::fixed << std::setprecision(1) << fps << " FPS | "
-               << std::setprecision(2) << avgFrameTime << "ms (Total) | "
-               << "Logic: " << logicTimeMs << "ms | "
-               << "Render: " << renderTimeMs << "ms";
-               
+            ss << "Voxel Engine (MultiDraw Indirect) | " << std::fixed << std::setprecision(1) << 1000.0/avg << " FPS | "
+               << std::setprecision(2) << avg << "ms | "
+               << "L:" << logicTimeMs << " R:" << renderTimeMs;
             SDL_SetWindowTitle(window, ss.str().c_str());
-            
-            timeAccumulator = 0.0;
-            frameCount = 0;
+            acc = 0; frames = 0;
         }
     }
     return 0;

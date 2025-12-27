@@ -4,7 +4,6 @@ module;
 export module VoxelGame.GL;
 
 export namespace VoxelGame::GL {
-    // Defines types inside namespace to avoid collision with standard headers
     typedef void (APIENTRY *PFN_GLGENVERTEXARRAYS) (GLsizei n, GLuint *arrays);
     typedef void (APIENTRY *PFN_GLBINDVERTEXARRAY) (GLuint array);
     typedef void (APIENTRY *PFN_GLGENBUFFERS) (GLsizei n, GLuint *buffers);
@@ -36,9 +35,29 @@ export namespace VoxelGame::GL {
     typedef void (APIENTRY *PFN_GLTEXSUBIMAGE3D) (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels);
     typedef void (APIENTRY *PFN_GLTEXPARAMETERI) (GLenum target, GLenum pname, GLint param);
 
-    // SSBO (OpenGL 4.3 / 3.1 with extension)
     #define GL_SHADER_STORAGE_BUFFER 0x90D2
     typedef void (APIENTRY *PFN_GLBINDBUFFERBASE) (GLenum target, GLuint index, GLuint buffer);
+
+    // Indirect Draw
+    #define GL_DRAW_INDIRECT_BUFFER 0x8F3F
+    
+    struct DrawArraysIndirectCommand {
+        GLuint  count;
+        GLuint  instanceCount;
+        GLuint  first;
+        GLuint  baseInstance;
+    };
+
+    struct DrawElementsIndirectCommand {
+        GLuint  count;
+        GLuint  instanceCount;
+        GLuint  firstIndex;
+        GLuint  baseVertex;
+        GLuint  baseInstance;
+    };
+
+    typedef void (APIENTRY *PFN_GLMULTIDRAWARRAYSINDIRECT) (GLenum mode, const void *indirect, GLsizei drawcount, GLsizei stride);
+    typedef void (APIENTRY *PFN_GLMULTIDRAWELEMENTSINDIRECT) (GLenum mode, GLenum type, const void *indirect, GLsizei drawcount, GLsizei stride);
 
     // Function Pointers
     PFN_GLGENVERTEXARRAYS glGenVertexArrays;
@@ -72,6 +91,8 @@ export namespace VoxelGame::GL {
     PFN_GLTEXPARAMETERI glTexParameteri;
     
     PFN_GLBINDBUFFERBASE glBindBufferBase;
+    PFN_GLMULTIDRAWARRAYSINDIRECT glMultiDrawArraysIndirect;
+    PFN_GLMULTIDRAWELEMENTSINDIRECT glMultiDrawElementsIndirect;
 
     void LoadFunctions() {
         glGenVertexArrays = (PFN_GLGENVERTEXARRAYS)SDL_GL_GetProcAddress("glGenVertexArrays");
@@ -105,5 +126,7 @@ export namespace VoxelGame::GL {
         glTexParameteri = (PFN_GLTEXPARAMETERI)SDL_GL_GetProcAddress("glTexParameteri");
         
         glBindBufferBase = (PFN_GLBINDBUFFERBASE)SDL_GL_GetProcAddress("glBindBufferBase");
+        glMultiDrawArraysIndirect = (PFN_GLMULTIDRAWARRAYSINDIRECT)SDL_GL_GetProcAddress("glMultiDrawArraysIndirect");
+        glMultiDrawElementsIndirect = (PFN_GLMULTIDRAWELEMENTSINDIRECT)SDL_GL_GetProcAddress("glMultiDrawElementsIndirect");
     }
 }

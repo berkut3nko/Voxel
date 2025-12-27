@@ -23,24 +23,23 @@ export namespace VoxelGame::Meshing {
         int face; 
     };
 
-    struct PackedVertex {
-        uint32_t positionData; 
-        uint32_t attributeData; 
-        uint32_t quadUV;        
+    // Структура для SSBO (8 байт), вирівняна як uvec2 у шейдері
+    struct GpuQuad {
+        uint32_t data1; // x,y,z,face,tex
+        uint32_t data2; // w,h
     };
 
-    uint32_t packPos(int x, int y, int z) {
-        return (x & 0xFF) | ((y & 0xFF) << 8) | ((z & 0xFF) << 16);
+    // Упаковка даних для SSBO
+    uint32_t packData1(int x, int y, int z, int face, int texLayer) {
+        return (x & 0xFF) | 
+               ((y & 0xFF) << 8) | 
+               ((z & 0xFF) << 16) |
+               ((face & 0x07) << 24) |
+               ((texLayer & 0x1F) << 27);
     }
 
-    uint32_t packAttr(int normal, int texLayer) {
-        return (normal & 0x07) | ((texLayer & 0xFF) << 3);
-    }
-
-    uint32_t packUV(float u, float v) {
-        uint16_t ui = (uint16_t)(u * 65535.0f);
-        uint16_t vi = (uint16_t)(v * 65535.0f);
-        return (uint32_t)ui | ((uint32_t)vi << 16);
+    uint32_t packData2(int w, int h) {
+        return (w & 0xFFFF) | ((h & 0xFFFF) << 16);
     }
 
     struct MeshingContext {
@@ -175,96 +174,20 @@ export namespace VoxelGame::Meshing {
         return resultQuads;
     }
 
-    std::vector<PackedVertex> Triangulate(const std::vector<Quad>& quads) {
-        std::vector<PackedVertex> vertices;
-        vertices.reserve(quads.size() * 6);
+    // Замість Triangulate - збираємо дані для SSBO
+    std::vector<GpuQuad> BuildSSBOData(const std::vector<Quad>& quads) {
+        std::vector<GpuQuad> gpuQuads;
+        gpuQuads.reserve(quads.size());
 
         for (const auto& q : quads) {
-            int x0 = q.x;
-            int y0 = q.y;
-            int z0 = q.z;
-            int w = q.w; 
-            int h = q.h; 
-            
             int texLayer = GetTextureLayer(q.type);
             if(texLayer < 0) texLayer = 0;
 
-            int face = q.face; 
-            struct P { int x,y,z; };
-            P p1, p2, p3, p4;
+            uint32_t d1 = packData1(q.x, q.y, q.z, q.face, texLayer);
+            uint32_t d2 = packData2(q.w, q.h);
 
-            // FIX: Remove redundant +1 for Positive Faces (X+, Y+, Z+)
-            // GenerateQuads already sets x0/y0/z0 to the correct plane boundary.
-
-            switch(face) {
-                case 0: // X+ (Right) -> FIXED
-                    // Normal (1,0,0)
-                    // x0 is already x+1 from GenerateQuads
-                    p1 = {x0,   y0,   z0};
-                    p2 = {x0,   y0+w, z0};
-                    p3 = {x0,   y0+w, z0+h};
-                    p4 = {x0,   y0,   z0+h};
-                    break;
-
-                case 1: // X- (Left)
-                    // Normal (-1,0,0)
-                    p1 = {x0, y0,   z0};
-                    p2 = {x0, y0,   z0+h};
-                    p3 = {x0, y0+w, z0+h};
-                    p4 = {x0, y0+w, z0};
-                    break;
-
-                case 2: // Y+ (Top) -> FIXED previously
-                    // Normal (0,1,0)
-                    p1 = {x0,   y0, z0};
-                    p2 = {x0,   y0, z0+w}; 
-                    p3 = {x0+h, y0, z0+w}; 
-                    p4 = {x0+h, y0, z0};
-                    break;
-
-                case 3: // Y- (Bottom)
-                    // Normal (0,-1,0)
-                    p1 = {x0,   y0, z0};
-                    p2 = {x0+h, y0, z0};
-                    p3 = {x0+h, y0, z0+w};
-                    p4 = {x0,   y0, z0+w};
-                    break;
-
-                case 4: // Z+ (Front) -> FIXED
-                    // Normal (0,0,1)
-                    // z0 is already z+1
-                    p1 = {x0,   y0,   z0};
-                    p2 = {x0+w, y0,   z0};
-                    p3 = {x0+w, y0+h, z0};
-                    p4 = {x0,   y0+h, z0};
-                    break;
-
-                case 5: // Z- (Back)
-                    // Normal (0,0,-1)
-                    p1 = {x0,   y0,   z0};
-                    p2 = {x0,   y0+h, z0};
-                    p3 = {x0+w, y0+h, z0};
-                    p4 = {x0+w, y0,   z0};
-                    break;
-            }
-
-            uint32_t attr = packAttr(face, texLayer);
-
-            uint32_t uv00 = packUV(0.0f, 0.0f);
-            uint32_t uv10 = packUV(1.0f, 0.0f);
-            uint32_t uv11 = packUV(1.0f, 1.0f);
-            uint32_t uv01 = packUV(0.0f, 1.0f);
-
-            // Triangle 1: p1-p2-p3 (00 - 10 - 11)
-            vertices.push_back({ packPos(p1.x, p1.y, p1.z), attr, uv00 });
-            vertices.push_back({ packPos(p2.x, p2.y, p2.z), attr, uv10 });
-            vertices.push_back({ packPos(p3.x, p3.y, p3.z), attr, uv11 });
-
-            // Triangle 2: p1-p3-p4 (00 - 11 - 01)
-            vertices.push_back({ packPos(p1.x, p1.y, p1.z), attr, uv00 });
-            vertices.push_back({ packPos(p3.x, p3.y, p3.z), attr, uv11 });
-            vertices.push_back({ packPos(p4.x, p4.y, p4.z), attr, uv01 });
+            gpuQuads.push_back({d1, d2});
         }
-        return vertices;
+        return gpuQuads;
     }
 }
