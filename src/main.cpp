@@ -52,15 +52,14 @@ float WrapAngle(float angle) {
 int main(int argc, char* argv[]) {
     // 1. Forced check format (User requirement: !SDL_Init)
     if (!SDL_Init(SDL_INIT_VIDEO)) {
-        std::cerr << "SDL_Init failed logic check (returned 0/success or error depending on SDL version)" << std::endl;
-        // Продовжуємо, як просили
+        std::cerr << "SDL_Init failed logic check" << std::endl;
     }
     
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 
-    SDL_Window* window = SDL_CreateWindow("Voxel Game - Advanced Culling", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    SDL_Window* window = SDL_CreateWindow("Voxel Game - Y-Axis LOD", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     if (!window) return -1;
 
     SDL_GLContext context = SDL_GL_CreateContext(window);
@@ -238,14 +237,32 @@ int main(int argc, char* argv[]) {
         Mat4 vp = MultiplyMat4(proj, view);
         Frustum frustum = CreateFrustum(vp);
         
-        // --- LOD REGENERATION ---
+        // --- LOD REGENERATION (з урахуванням висоти) ---
         if (frameCounter % 30 == 0) {
             bool geometryChanged = false;
+            
+            // Поріг висоти для перемикання LOD1 -> LOD2 (наприклад, 100 блоків над землею)
+            float altitudeThreshold = 100.0f; 
+            bool highAltitude = (camY > altitudeThreshold);
+
             for(auto& rc : renderChunks) {
                 float dx = (float)rc.chunkX * CHUNK_SIZE + 16.0f - camX;
                 float dz = (float)rc.chunkZ * CHUNK_SIZE + 16.0f - camZ;
                 float dist = std::sqrt(dx*dx + dz*dz);
+                
+                // Базовий LOD від відстані по горизонталі
                 int neededLod = GetChunkLOD(dist);
+                
+                // Якщо ми високо, форсуємо мінімум LOD 2 для тих, хто був LOD 1
+                if (highAltitude && neededLod == 1) {
+                    neededLod = 2;
+                }
+                
+                // Якщо ми опустилися вниз, повертаємо LOD 1 для близьких чанків
+                if (!highAltitude && neededLod == 2 && dist < 96.0f) {
+                     neededLod = 1; // Повернення деталізації
+                }
+
                 if (rc.currentLod != neededLod) {
                     VoxelChunk* chunk = world.getChunk(rc.chunkX, rc.chunkZ);
                     if (chunk) {
@@ -255,6 +272,7 @@ int main(int argc, char* argv[]) {
                         ctx.neighbors[1] = world.getChunk(rc.chunkX - 1, rc.chunkZ);
                         ctx.neighbors[4] = world.getChunk(rc.chunkX, rc.chunkZ + 1);
                         ctx.neighbors[5] = world.getChunk(rc.chunkX, rc.chunkZ - 1);
+                        
                         std::vector<Quad> quads = GenerateQuads(ctx, neededLod);
                         rc.gpuQuads = BuildSSBOData(quads);
                         rc.currentLod = neededLod;
@@ -262,6 +280,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
+            
             if (geometryChanged) {
                 allGpuQuads.clear();
                 allGpuQuads.reserve(renderChunks.size() * 1500); 
@@ -274,7 +293,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // --- CULLING PASS (Advanced) ---
+        // --- CULLING PASS ---
         visibleIndices.clear();
         culledChunks = 0;
         horizonCulled = 0;
@@ -282,22 +301,16 @@ int main(int argc, char* argv[]) {
         float camDirX = std::cos(radYaw);
         float camDirZ = std::sin(radYaw);
         
-        // 1. Dynamic Yaw Culling with Backward Shift
-        // Чим більший нахил камери (вниз або вгору), тим більше ми "зсуваємо" центр перевірки Yaw назад.
-        // Це розширює конус огляду навколо гравця, імітуючи трапецію.
+        // 1. Dynamic Yaw Culling
         float pitchFactor = std::abs(std::sin(radPitch)); 
-        
-        // Зміщення центру перевірки назад (проти напрямку погляду)
-        // При 90 градусах (дивимось вниз) зміщуємо на радіус огляду, щоб бачити все навколо
         float backwardShift = pitchFactor * (range * CHUNK_SIZE * 0.8f); 
         float checkX = camX - camDirX * backwardShift;
         float checkZ = camZ - camDirZ * backwardShift;
 
-        // Базовий FOV для Yaw
         float fovRad = (FOV_DEG + YAW_PADDING) * 0.0174533f;
         float minCosYaw = std::cos(fovRad / 2.0f);
 
-        // 2. Pitch Culling Params
+        // 2. Pitch Culling
         float fovVRad = (FOV_DEG * 0.0174533f) / aspect; 
         float minPitchAngle = radPitch - fovVRad * 0.7f;
         float maxPitchAngle = radPitch + fovVRad * 0.7f;
@@ -307,24 +320,21 @@ int main(int argc, char* argv[]) {
             float cx = rc.chunkX * CHUNK_SIZE + CHUNK_SIZE/2.0f;
             float cz = rc.chunkZ * CHUNK_SIZE + CHUNK_SIZE/2.0f;
             
-            // Дистанція до реальної камери
             float realDx = cx - camX;
             float realDz = cz - camZ;
             float realDistSq = realDx*realDx + realDz*realDz;
             float realDist = std::sqrt(realDistSq);
 
-            // Дистанція до центру перевірки Yaw (зсунутого)
             float checkDx = cx - checkX;
             float checkDz = cz - checkZ;
             float checkDist = std::sqrt(checkDx*checkDx + checkDz*checkDz);
 
-            // Завжди малюємо дуже близькі чанки (до реальної камери)
             if (realDist < (CHUNK_SIZE * 1.5f)) {
                 visibleIndices.push_back({i, realDistSq});
                 continue;
             }
 
-            // --- Yaw Culling (Shifted Origin) ---
+            // Yaw Culling
             float dirX = checkDx / checkDist;
             float dirZ = checkDz / checkDist;
             float dot = dirX * camDirX + dirZ * camDirZ;
@@ -334,8 +344,7 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            // --- Pitch Culling (Vertical) ---
-            // Використовуємо реальну дистанцію
+            // Pitch Culling
             float angleBottom = std::atan2(0.0f - camY, realDist);
             float angleTop = std::atan2((float)rc.maxHeight - camY, realDist);
             
@@ -344,7 +353,7 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            // --- Frustum Culling ---
+            // Frustum Culling
             if (!FrustumCheckAABB(frustum, 
                 rc.chunkX * CHUNK_SIZE, 0, rc.chunkZ * CHUNK_SIZE, 
                 (rc.chunkX+1) * CHUNK_SIZE, CHUNK_SIZE, (rc.chunkZ+1) * CHUNK_SIZE)) {
@@ -355,7 +364,6 @@ int main(int argc, char* argv[]) {
             visibleIndices.push_back({i, realDistSq});
         }
 
-        // Сортуємо Front-to-Back
         std::sort(visibleIndices.begin(), visibleIndices.end(), [](const ChunkDist& a, const ChunkDist& b) {
             return a.distSq < b.distSq;
         });
@@ -366,7 +374,6 @@ int main(int argc, char* argv[]) {
         visibleCommands.clear();
         visibleChunkInfos.clear();
 
-        // Стандартний FOV для мапінгу горизонту
         float standardFovRad = FOV_DEG * 0.0174533f;
 
         for (const auto& item : visibleIndices) {
@@ -407,14 +414,12 @@ int main(int argc, char* argv[]) {
             } else {
                 if (bucketStart <= bucketEnd) {
                     for (int b = bucketStart; b <= bucketEnd; ++b) {
-                        // Зменшив bias для більш агресивного відсікання, оскільки у нас є Yaw/Pitch пре-фільтри
                         if (tanTheta >= horizonBuffer[b] - 0.01f) {
                             visible = true;
                             break;
                         }
                     }
                 } else {
-                    // Fallback для дуже далеких або тих, що не потрапили в бакети
                     visible = true;
                 }
             }
