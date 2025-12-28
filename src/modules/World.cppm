@@ -5,6 +5,8 @@ module;
 #include <algorithm>
 #include <tuple>
 #include <optional>
+#include <shared_mutex>
+#include <mutex>
 export module VoxelGame.World;
 
 import VoxelGame.Types;
@@ -16,7 +18,10 @@ export namespace VoxelGame::World {
     // --- Component: Chunk Data ---
     struct VoxelChunk {
         std::vector<VoxelType> voxels;
-        int chunkX, chunkZ; // World coordinates of the chunk
+        int chunkX, chunkZ;
+
+        // Для атомарного читання окремого чанка (якщо потрібно змінювати блоки в runtime)
+        // mutable std::shared_mutex chunkMutex; 
 
         VoxelChunk(int cx = 0, int cz = 0) : chunkX(cx), chunkZ(cz) {
             voxels.resize(CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE, AIR);
@@ -27,12 +32,14 @@ export namespace VoxelGame::World {
         }
 
         [[nodiscard]] VoxelType get(int x, int y, int z) const {
+            // std::shared_lock lock(chunkMutex); // Розкоментуй, якщо планується динамічна зміна блоків
             if (x < 0 || x >= CHUNK_SIZE || y < 0 || y >= CHUNK_SIZE || z < 0 || z >= CHUNK_SIZE)
                 return AIR;
             return voxels[index(x, y, z)];
         }
 
         void set(int x, int y, int z, VoxelType type) {
+            // std::unique_lock lock(chunkMutex);
             if (x >= 0 && x < CHUNK_SIZE && y >= 0 && y < CHUNK_SIZE && z >= 0 && z < CHUNK_SIZE) {
                 voxels[index(x, y, z)] = type;
             }
@@ -41,11 +48,20 @@ export namespace VoxelGame::World {
 
     // --- World Container ---
     struct WorldManager {
-        // Simple map: key = (x, z), value = Chunk
-        // Using a flat map or hashing for simplicity
         std::map<std::pair<int, int>, VoxelChunk> chunks;
+        mutable std::shared_mutex worldMutex; // Глобальний м'ютекс для карти чанків
 
         VoxelChunk* getChunk(int cx, int cz) {
+            std::shared_lock lock(worldMutex); // Shared lock для читання
+            auto it = chunks.find({cx, cz});
+            if (it != chunks.end()) {
+                return &it->second;
+            }
+            return nullptr;
+        }
+
+        // Версія getChunk, яка не блокує (використовувати, якщо лок вже взято ззовні)
+        VoxelChunk* getChunkUnsafe(int cx, int cz) {
             auto it = chunks.find({cx, cz});
             if (it != chunks.end()) {
                 return &it->second;
@@ -54,12 +70,13 @@ export namespace VoxelGame::World {
         }
 
         VoxelChunk& createChunk(int cx, int cz) {
-            // Emplace constructs in place
+            std::unique_lock lock(worldMutex); // Unique lock для запису (додавання в map)
             auto [it, inserted] = chunks.try_emplace({cx, cz}, cx, cz);
             return it->second;
         }
         
         void clear() {
+            std::unique_lock lock(worldMutex);
             chunks.clear();
         }
     };
@@ -81,15 +98,15 @@ export namespace VoxelGame::World {
         }
 
         void Generate(VoxelChunk& chunk, int seed) {
+            // Тут блокування не потрібне, якщо ми генеруємо чанк ДО того, як він став доступним іншим потокам (через createChunk)
+            // Але якщо це re-generation існуючого чанка - треба chunk.chunkMutex
             std::fill(chunk.voxels.begin(), chunk.voxels.end(), AIR);
 
             for (int x = 0; x < CHUNK_SIZE; ++x) {
                 for (int z = 0; z < CHUNK_SIZE; ++z) {
-                    // Global coordinates for smooth noise across chunks
                     float gx = (float)(chunk.chunkX * CHUNK_SIZE + x);
                     float gz = (float)(chunk.chunkZ * CHUNK_SIZE + z);
                     
-                    // Lower frequency for wider hills
                     float noiseVal = perlin(gx * 0.05f, gz * 0.05f, seed);
                     int height = 10 + (int)(noiseVal * 10.0f);
                     height = std::clamp(height, 1, CHUNK_SIZE - 1);
@@ -104,8 +121,6 @@ export namespace VoxelGame::World {
                         }
                     }
                     
-                    // Simple features relative to chunk logic just for demo
-                    // We disable complex structures spanning chunks for simplicity here
                     if (height < 20 && (x+z)%15 == 0) {
                          for(int ph = 1; ph <= 3; ph++) 
                             chunk.set(x, height + ph, z, PILLAR);

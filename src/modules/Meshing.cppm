@@ -44,6 +44,10 @@ export namespace VoxelGame::Meshing {
     }
 
     struct MeshingContext {
+        // Ми не зберігаємо вказівники на чанки тут, щоб уникнути race conditions,
+        // якщо чанк буде видалено. 
+        // Але в нашому випадку `World` стабільний, тому вказівники допустимі 
+        // за умови використання shared_lock на час мешингу.
         const VoxelChunk* center;
         const VoxelChunk* neighbors[6]; 
     };
@@ -64,7 +68,15 @@ export namespace VoxelGame::Meshing {
             while (data[row] != 0) {
                 int u = std::countr_zero(static_cast<UT>(data[row]));
                 int w_u = std::countr_one(static_cast<UT>(data[row] >> u));
-                UT h_mask_bits = (w_u == sizeof(T)*8) ? static_cast<UT>(~0) : ((static_cast<UT>(1) << w_u) - 1);
+                
+                // FIX: Overflow check logic specifically for uint8_t types
+                UT h_mask_bits;
+                if (w_u == sizeof(T) * 8) {
+                    h_mask_bits = static_cast<UT>(~0);
+                } else {
+                    h_mask_bits = (static_cast<UT>(1) << w_u) - 1;
+                }
+
                 UT mask = h_mask_bits << u;
                 
                 int h_v = 1; 
@@ -94,14 +106,12 @@ export namespace VoxelGame::Meshing {
         return AIR; 
     }
 
-    // --- Сканування вглиб для пошуку поверхневого матеріалу ---
-    // d_start - координата початку сканування (поверхня)
-    // scan_dir - напрямок сканування вглиб блоку (-1 або +1)
+    // --- Оптимізована функція вибору матеріалу ---
     VoxelType ScanDominantVoxel(const MeshingContext& ctx, 
                                int u_start, int v_start, int d_start,
                                int u_ax, int v_ax, int d_ax, 
                                int step, int scan_dir) {
-        // Оптимізація для LOD 1 (step=1) - просто беремо воксель
+        // Якщо крок 1, ніяких сканувань - точність понад усе
         if (step == 1) {
             int pos[3];
             pos[u_ax] = u_start;
@@ -110,13 +120,22 @@ export namespace VoxelGame::Meshing {
             return get_voxel_context(ctx, pos[0], pos[1], pos[2]);
         }
 
-        int counts[MAX_MATERIAL_TYPES + 1] = {0};
+        // ОПТИМІЗАЦІЯ: Вагове голосування + Ігнорування INTERNAL
+        // k=0 (поверхня) має вагу 10
+        // k=1 (глибше) має вагу 5
+        // k>1 (глибоко) має вагу 1
         
-        // Ітеруємося по поверхні грані (step x step)
+        int weights[MAX_MATERIAL_TYPES + 1] = {0};
+        bool foundAnySolid = false;
+
+        // Не скануємо кожен піксель, беремо вибірку для швидкості.
+        // Замість step*step, перевіряємо центр і кути (опціонально),
+        // але для стабільності на LOD3 залишимо повний цикл, але обмежимо глибину k.
+        
         for (int du = 0; du < step; ++du) {
             for (int dv = 0; dv < step; ++dv) {
                 
-                // Raycast вглиб для кожного "пікселя" супер-вокселя
+                // Скануємо вглиб
                 for (int k = 0; k < step; ++k) {
                     int pos[3];
                     pos[u_ax] = u_start + du;
@@ -125,31 +144,42 @@ export namespace VoxelGame::Meshing {
 
                     VoxelType t = get_voxel_context(ctx, pos[0], pos[1], pos[2]);
                     
-                    // Якщо знайшли непрозорий блок - це поверхня для цього променя
                     if (!IsTransparent(t)) {
                         int matID = GetMaterialID(t);
                         if (matID >= MAX_MATERIAL_TYPES) matID = 0;
+
+                        // БАГ ФІКС: Ігноруємо INTERNAL блок (ID=4), якщо це можливо.
+                        // Це запобігає появі технічної текстури на LOD3.
+                        if (matID == 4) { // 4 is INTERNAL based on Types.cppm
+                             // Можна перервати цей промінь, ніби ми вперлися в землю
+                             break;
+                        }
+
+                        // Вагова система
+                        int w = (k == 0) ? 10 : ((k == 1) ? 5 : 1);
+                        weights[matID] += w;
+                        foundAnySolid = true;
                         
-                        counts[matID]++;
-                        break; // Зупиняємося, бо глибші вокселі закриті цим
+                        // Якщо ми знайшли поверхню (k=0), далі цей промінь не цікавий
+                        break; 
                     }
-                    // Якщо прозорий (AIR), продовжуємо йти вглиб (k++)
                 }
             }
         }
 
-        // Знаходимо переможця (Majority Vote)
-        int max_count = -1;
+        if (!foundAnySolid) return AIR;
+
+        // Знаходимо переможця
+        int max_w = -1;
         int winner_id = 0;
 
         for (int i = 0; i < MAX_MATERIAL_TYPES; ++i) {
-            if (counts[i] > max_count) {
-                max_count = counts[i];
+            if (weights[i] > max_w) {
+                max_w = weights[i];
                 winner_id = i;
             }
         }
 
-        // Якщо перемогло повітря або нічого не знайдено
         if (winner_id == 0) return AIR;
 
         return (winner_id << 3) | 0x07;
@@ -165,8 +195,6 @@ export namespace VoxelGame::Meshing {
             int v_ax = (d + 2) % 3;
             
             int l_x[3] = {0, 0, 0}; 
-            int q[3] = {0, 0, 0}; 
-            q[d] = 1;
 
             for (l_x[d] = -1; l_x[d] < GRID_SIZE; ++l_x[d]) {
                 for (int side = 0; side < 2; ++side) {
@@ -177,18 +205,11 @@ export namespace VoxelGame::Meshing {
                     for (l_x[v_ax] = 0; l_x[v_ax] < GRID_SIZE; ++l_x[v_ax]) {     
                         for (l_x[u_ax] = 0; l_x[u_ax] < GRID_SIZE; ++l_x[u_ax]) { 
                             
-                            // Світова координата межі між супер-вокселями
                             int world_boundary_d = (l_x[d] + 1) * step;
-
                             int world_u = l_x[u_ax] * step;
                             int world_v = l_x[v_ax] * step;
 
-                            // curr: знаходиться "зліва" від межі. 
-                            // Ми дивимось на його грань +d. Отже, скануємо від межі (boundary-1) ВНИЗ/ВЛІВО (-1).
                             VoxelType curr = ScanDominantVoxel(ctx, world_u, world_v, world_boundary_d - 1, u_ax, v_ax, d, step, -1);
-                            
-                            // next: знаходиться "справа" від межі.
-                            // Ми дивимось на його грань -d. Отже, скануємо від межі (boundary) ВВЕРХ/ВПРАВО (+1).
                             VoxelType next = ScanDominantVoxel(ctx, world_u, world_v, world_boundary_d,     u_ax, v_ax, d, step,  1);
 
                             bool cSolid = !IsTransparent(curr);
@@ -197,10 +218,12 @@ export namespace VoxelGame::Meshing {
                             VoxelType faceType = AIR;
 
                             if (side == 0) { 
+                                // Looking towards +axis. Need Solid (curr) -> Air (next)
                                 if (l_x[d] >= 0 && l_x[d] < GRID_SIZE) {
                                     if (cSolid && !nSolid) faceType = curr;
                                 }
                             } else { 
+                                // Looking towards -axis. Need Air (curr) -> Solid (next)
                                 int nextPos = l_x[d] + 1;
                                 if (nextPos >= 0 && nextPos < GRID_SIZE) {
                                     if (!cSolid && nSolid) faceType = next;
@@ -220,6 +243,11 @@ export namespace VoxelGame::Meshing {
                     if (!any_face) continue;
 
                     for (int matID = 0; matID < MAX_MATERIAL_TYPES; ++matID) {
+                        // Skip expensive binary meshing if mask is empty (simple optimization)
+                        bool empty = true;
+                        for(auto val : material_masks[matID]) if(val != 0) { empty = false; break; }
+                        if(empty) continue;
+
                         auto binaryQuads = GreedyMeshBinaryPlane<T, N>(material_masks[matID]);
 
                         for (const auto& bq : binaryQuads) {
