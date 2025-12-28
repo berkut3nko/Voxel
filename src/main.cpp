@@ -4,17 +4,13 @@
 #include <iostream>
 #include <ctime>
 #include <cmath>
-#include <chrono> 
-#include <string>
-#include <iomanip>
-#include <sstream>
 #include <algorithm> 
 #include <thread>
 #include <queue>
 #include <mutex>
-#include <condition_variable>
 #include <atomic>
-#include <optional>
+#include <cstring> 
+#include <iomanip> 
 
 import VoxelGame.Types;
 import VoxelGame.Math;
@@ -35,52 +31,29 @@ using namespace VoxelGame::RenderUtils;
 
 namespace GL = VoxelGame::GL;
 
-// --- Config ---
-const float FOV_DEG = 100.0f;         
-const float YAW_PADDING = 10.0f;      
-const int HORIZON_BUCKETS = 256; 
+const int RENDER_DISTANCE = 16; 
+const int MAX_CHUNKS = (RENDER_DISTANCE * 2 + 1) * (RENDER_DISTANCE * 2 + 1);
+const size_t MAX_QUADS_BUFFER = 16000000; 
 
-// --- Multithreading Data Structures ---
-struct MeshJob {
-    int cx, cz;
-    int lod;
-    int maxHeight; // Need for culling, calculated during meshing usually, or pre-calc
-};
-
-struct MeshResult {
-    int cx, cz;
-    int lod;
+struct GpuChunkInput {
+    int packedXZ; 
+    unsigned int quadStart;
+    unsigned int quadCount;
     int maxHeight;
-    std::vector<GpuQuad> gpuQuads;
-    bool valid;
+    unsigned int scale; // 1, 2, 4
+    int padding;
 };
 
-// Thread-safe Queue
+struct MeshJob { int cx, cz, lod; };
+struct MeshResult { int cx, cz, lod, maxHeight; std::vector<GpuQuad> gpuQuads; bool valid; };
+
 template<typename T>
 class SafeQueue {
-    std::queue<T> q;
-    std::mutex m;
+    std::queue<T> q; std::mutex m;
 public:
-    void push(T val) {
-        std::lock_guard<std::mutex> lk(m);
-        q.push(std::move(val));
-    }
-    bool try_pop(T& val) {
-        std::lock_guard<std::mutex> lk(m);
-        if(q.empty()) return false;
-        val = std::move(q.front());
-        q.pop();
-        return true;
-    }
-    bool empty() {
-        std::lock_guard<std::mutex> lk(m);
-        return q.empty();
-    }
-    void clear() {
-        std::lock_guard<std::mutex> lk(m);
-        std::queue<T> empty;
-        std::swap(q, empty);
-    }
+    void push(T val) { std::lock_guard<std::mutex> lk(m); q.push(std::move(val)); }
+    bool try_pop(T& val) { std::lock_guard<std::mutex> lk(m); if(q.empty())return false; val=std::move(q.front()); q.pop(); return true; }
+    bool empty() { std::lock_guard<std::mutex> lk(m); return q.empty(); }
 };
 
 SafeQueue<MeshJob> jobQueue;
@@ -91,489 +64,348 @@ void MeshWorker(WorldManager* world) {
     while(!stopWorkers) {
         MeshJob job;
         if(jobQueue.try_pop(job)) {
-            // Read Lock is essential for thread safety while reading voxels
-            // Note: shared_lock is held implicitly by Meshing logic if we updated World.cppm 
-            // OR we explicitly hold it here if we access the map structure.
-            // Since getChunk in World.cppm now uses shared_lock internally for map access,
-            // we are safe to get pointers. BUT, the vector inside chunk is not protected 
-            // from modification if another thread writes to it. 
-            // Assuming static world for now after gen.
-            
-            // To be 100% safe against re-allocation of vectors, we grab pointers.
-            // Using the thread-safe getChunk:
             VoxelChunk* center = world->getChunk(job.cx, job.cz);
-            
-            if (!center) {
-                resultQueue.push({job.cx, job.cz, job.lod, 0, {}, false});
-                continue;
-            }
+            if (!center) { resultQueue.push({job.cx, job.cz, job.lod, 0, {}, false}); continue; }
 
             MeshingContext ctx = {};
             ctx.center = center;
-            ctx.neighbors[0] = world->getChunk(job.cx + 1, job.cz);
-            ctx.neighbors[1] = world->getChunk(job.cx - 1, job.cz);
-            ctx.neighbors[4] = world->getChunk(job.cx, job.cz + 1);
-            ctx.neighbors[5] = world->getChunk(job.cx, job.cz - 1);
-            ctx.neighbors[2] = world->getChunk(job.cx, job.cz); // Top placeholder
-            ctx.neighbors[3] = world->getChunk(job.cx, job.cz); // Bottom placeholder
+            ctx.neighbors[0] = world->getChunk(job.cx+1, job.cz);
+            ctx.neighbors[1] = world->getChunk(job.cx-1, job.cz);
+            ctx.neighbors[4] = world->getChunk(job.cx, job.cz+1);
+            ctx.neighbors[5] = world->getChunk(job.cx, job.cz-1);
+            // FIX: Vertical neighbors are nullptr to prevent wrapping bugs
+            ctx.neighbors[2] = nullptr; 
+            ctx.neighbors[3] = nullptr;
 
-            // Calculate Max Height (for culling)
             int maxH = 0;
-            // Simple sampling for MaxH to avoid full scan cost if not needed, 
-            // but for correct culling we need it. 
-            // Let's do a quick scan.
-            for (int lx = 0; lx < CHUNK_SIZE; lx += 4) { 
-                for (int lz = 0; lz < CHUNK_SIZE; lz += 4) {
-                    for (int ly = CHUNK_SIZE - 1; ly >= 0; --ly) {
-                        if (!IsTransparent(center->get(lx, ly, lz))) {
-                            if (ly > maxH) maxH = ly;
-                            break;
-                        }
-                    }
-                }
-            }
-            maxH += 2; if (maxH > CHUNK_SIZE) maxH = CHUNK_SIZE;
+            for (int lx=0; lx<CHUNK_SIZE; lx+=4) 
+                for (int lz=0; lz<CHUNK_SIZE; lz+=4) 
+                    for (int ly=CHUNK_SIZE-1; ly>=0; --ly) 
+                        if (!IsTransparent(center->get(lx, ly, lz))) { if (ly>maxH) maxH=ly; break; }
+            maxH += 2; if (maxH>CHUNK_SIZE) maxH=CHUNK_SIZE;
 
-            std::vector<Quad> quads = GenerateQuads(ctx, job.lod);
-            std::vector<GpuQuad> gpuQ = BuildSSBOData(quads);
-            
-            resultQueue.push({job.cx, job.cz, job.lod, maxH, std::move(gpuQ), true});
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
+            auto quads = GenerateQuads(ctx, job.lod);
+            resultQueue.push({job.cx, job.cz, job.lod, maxH, BuildSSBOData(quads), true});
+        } else std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
 
-struct ChunkRenderDataExtended {
-    std::vector<GpuQuad> gpuQuads;
-    int chunkX, chunkZ;
-    unsigned int globalBufferOffset; 
-    int maxHeight; 
-    int currentLod; 
-    bool isMeshDirty; // Flag to indicate pending update
+struct RenderChunk {
+    int cx, cz;
+    int lod;
+    int maxHeight;
+    unsigned int gpuOffset; 
+    unsigned int gpuCount;
+    bool inGpu;
 };
 
-// Нормалізація кута [-PI, PI]
-float WrapAngle(float angle) {
-    while (angle > 3.14159265f) angle -= 6.2831853f;
-    while (angle < -3.14159265f) angle += 6.2831853f;
-    return angle;
-}
+struct GpuMemoryManager {
+    size_t currentOffset = 0;
+    size_t capacity = 0;
+    void Init(size_t cap) { capacity = cap; currentOffset = 0; }
+    bool Allocate(size_t count, unsigned int& outOffset) {
+        if (currentOffset + count > capacity) return false;
+        outOffset = (unsigned int)currentOffset;
+        currentOffset += count;
+        return true;
+    }
+    void Reset() { currentOffset = 0; }
+};
 
 int main(int argc, char* argv[]) {
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
-        std::cerr << "SDL_Init failed logic check" << std::endl;
-    }
-    
+    SDL_Init(SDL_INIT_VIDEO);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-
-    SDL_Window* window = SDL_CreateWindow("Voxel Game - Optimized Multithreading", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
-    if (!window) return -1;
-
+    
+    SDL_Window* window = SDL_CreateWindow("Voxel Engine - Fix", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     SDL_GLContext context = SDL_GL_CreateContext(window);
-    if (!context) return -1;
-    
     SDL_GL_MakeCurrent(window, context);
-    SDL_GL_SetSwapInterval(0); 
-    
-    GL::LoadFunctions(); 
-    
-    bool mouseCaptured = true;
+    SDL_GL_SetSwapInterval(0);
+    GL::LoadFunctions();
     SDL_SetWindowRelativeMouseMode(window, true);
-
+    
     WorldManager world;
-    int seed = std::time(nullptr) % 1000;
-    
-    int range = 12; 
-    size_t estChunks = (range * 2 + 1) * (range * 2 + 1);
-    
-    std::cout << "Generating chunks (Range: " << range << ")..." << std::endl;
-    
-    // Initial Generation (Sync for simplicity or could be threaded too)
-    for (int cx = -range; cx <= range; ++cx) {
-        for (int cz = -range; cz <= range; ++cz) {
+    int seed = std::time(nullptr);
+    std::cout << "Generating " << MAX_CHUNKS << " chunks..." << std::endl;
+    for (int cx = -RENDER_DISTANCE; cx <= RENDER_DISTANCE; ++cx) {
+        for (int cz = -RENDER_DISTANCE; cz <= RENDER_DISTANCE; ++cz) {
             TerrainSystem::Generate(world.createChunk(cx, cz), seed);
         }
     }
 
-    std::cout << "Starting Thread Pool..." << std::endl;
-    unsigned int threadCount = std::thread::hardware_concurrency() - 1;
-    if(threadCount < 1) threadCount = 1;
-    
+    unsigned int threadCount = std::thread::hardware_concurrency();
     std::vector<std::jthread> workers;
-    for(unsigned int i=0; i<threadCount; ++i) {
-        workers.emplace_back(MeshWorker, &world);
-    }
+    for(unsigned int i=0; i<threadCount; ++i) workers.emplace_back(MeshWorker, &world);
 
-    std::vector<ChunkRenderDataExtended> renderChunks;
-    std::vector<GpuQuad> allGpuQuads;
-
-    // Map to quickly find render data by coordinates
-    // Using simple linear search for now as N is small (~600 chunks), 
-    // but for larger worlds use std::map or hash map.
-    auto findChunk = [&](int cx, int cz) -> ChunkRenderDataExtended* {
-        for(auto& rc : renderChunks) {
-            if(rc.chunkX == cx && rc.chunkZ == cz) return &rc;
+    std::vector<RenderChunk> renderChunks;
+    renderChunks.reserve(MAX_CHUNKS);
+    int totalInitialChunks = 0;
+    for (int cx = -RENDER_DISTANCE; cx <= RENDER_DISTANCE; ++cx) {
+        for (int cz = -RENDER_DISTANCE; cz <= RENDER_DISTANCE; ++cz) {
+            renderChunks.push_back({cx, cz, -1, 0, 0, 0, false});
+            jobQueue.push({cx, cz, 1}); 
+            totalInitialChunks++;
         }
+    }
+    
+    auto findChunk = [&](int cx, int cz) -> RenderChunk* {
+        int r = RENDER_DISTANCE;
+        int idx = (cx + r) * (2*r + 1) + (cz + r);
+        if (idx >= 0 && idx < renderChunks.size()) return &renderChunks[idx];
         return nullptr;
     };
 
-    // Initial Mesh Push
-    for (int cx = -range; cx <= range; ++cx) {
-        for (int cz = -range; cz <= range; ++cz) {
-            float dist = std::sqrt(float(cx * cx + cz * cz)) * CHUNK_SIZE;
-            int lod = GetChunkLOD(dist);
-            
-            ChunkRenderDataExtended crd;
-            crd.chunkX = cx;
-            crd.chunkZ = cz;
-            crd.currentLod = -1; // Force update
-            crd.isMeshDirty = true;
-            crd.maxHeight = CHUNK_SIZE;
-            crd.globalBufferOffset = 0;
-            
-            renderChunks.push_back(std::move(crd));
-            
-            jobQueue.push({cx, cz, lod, 0});
-        }
-    }
+    GLuint ssboQuads, ssboInputChunks, ssboDrawCommands, ssboVisibleChunks, atomicCounterBuf;
+    GL::glGenBuffers(1, &ssboQuads);
+    GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboQuads);
+    GL::glBufferData(GL::SHADER_STORAGE_BUFFER, MAX_QUADS_BUFFER * sizeof(GpuQuad), nullptr, GL_DYNAMIC_DRAW);
+    GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 0, ssboQuads); 
 
-    // GL Buffers initialization
-    GLuint emptyVAO;
+    GL::glGenBuffers(1, &ssboInputChunks);
+    GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboInputChunks);
+    GL::glBufferData(GL::SHADER_STORAGE_BUFFER, MAX_CHUNKS * sizeof(GpuChunkInput), nullptr, GL_DYNAMIC_DRAW);
+    GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 1, ssboInputChunks); 
+
+    GL::glGenBuffers(1, &ssboDrawCommands);
+    GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboDrawCommands);
+    GL::glBufferData(GL::SHADER_STORAGE_BUFFER, MAX_CHUNKS * sizeof(GL::DrawElementsIndirectCommand), nullptr, GL_DYNAMIC_DRAW);
+    GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 2, ssboDrawCommands); 
+    
+    GL::glGenBuffers(1, &ssboVisibleChunks);
+    GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboVisibleChunks);
+    GL::glBufferData(GL::SHADER_STORAGE_BUFFER, MAX_CHUNKS * sizeof(GpuChunkInfo), nullptr, GL_DYNAMIC_DRAW);
+    GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 3, ssboVisibleChunks); 
+
+    GL::glGenBuffers(1, &atomicCounterBuf);
+    GL::glBindBuffer(GL::ATOMIC_COUNTER_BUFFER, atomicCounterBuf); 
+    GLuint zero = 0;
+    GL::glBufferData(GL::ATOMIC_COUNTER_BUFFER, sizeof(GLuint), &zero, GL_DYNAMIC_DRAW);
+    GL::glBindBufferBase(GL::ATOMIC_COUNTER_BUFFER, 0, atomicCounterBuf);
+
+    ShaderProgram drawShader = CreateProgram("src/shaders/voxel.vert.glsl", "src/shaders/voxel.frag.glsl");
+    ShaderProgram cullShader = CreateComputeProgram("src/shaders/cull.comp.glsl");
+    
+    GLuint heightMapTex;
+    GL::glGenTextures(1, &heightMapTex);
+    GL::glBindTexture(GL_TEXTURE_2D, heightMapTex);
+    int mapSize = RENDER_DISTANCE * 2 + 1;
+    GL::glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, mapSize, mapSize, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
+    GL::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    GL::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    GL::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, 0x812F); 
+    GL::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, 0x812F);
+    std::vector<GLubyte> heightMapData(mapSize * mapSize, 0);
+
+    GLuint emptyVAO, ibo;
     GL::glGenVertexArrays(1, &emptyVAO);
     GL::glBindVertexArray(emptyVAO);
-
-    GLuint indices[] = {0, 1, 2, 0, 2, 3};
-    GLuint ibo;
+    GLuint indices[] = {0,1,2, 0,2,3};
     GL::glGenBuffers(1, &ibo);
     GL::glBindBuffer(0x8893, ibo); 
     GL::glBufferData(0x8893, sizeof(indices), indices, GL_STATIC_DRAW);
     GL::glBindVertexArray(0);
 
-    GLuint ssboQuads, ssboChunks, indirectBuffer;
-    GL::glGenBuffers(1, &ssboQuads);
-    GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboQuads);
-    // Allocate huge buffer initially
-    GL::glBufferData(GL::SHADER_STORAGE_BUFFER, estChunks * 2000 * sizeof(GpuQuad), nullptr, GL_DYNAMIC_DRAW); 
-    GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 0, ssboQuads);
+    GLuint texArrayID = CreatePaletteTextureArray();
 
-    GL::glGenBuffers(1, &ssboChunks);
-    GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboChunks);
-    GL::glBufferData(GL::SHADER_STORAGE_BUFFER, estChunks * sizeof(GpuChunkInfo), nullptr, GL_DYNAMIC_DRAW);
-    GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 1, ssboChunks);
-
-    GL::glGenBuffers(1, &indirectBuffer);
-    GL::glBindBuffer(GL::DRAW_INDIRECT_BUFFER, indirectBuffer);
-    GL::glBufferData(GL::DRAW_INDIRECT_BUFFER, estChunks * sizeof(GL::DrawElementsIndirectCommand), nullptr, GL_DYNAMIC_DRAW);
-
-    ShaderProgram shader = CreateProgram("src/shaders/voxel.vert.glsl", "src/shaders/voxel.frag.glsl");
-    if (shader.id == 0) return -1;
-    
-    GL::glUseProgram(shader.id);
-    GLuint texArrayID = CreatePaletteTextureArray(); 
-    GL::glActiveTexture(GL_TEXTURE0);
-    GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texArrayID);
-    GL::glUniform1i(shader.loc_textureArray, 0);
-
-    float camX = 0.0f, camY = 40.0f, camZ = 0.0f;
-    float yaw = -90.0f, pitch = -30.0f;
+    float camX=0, camY=60, camZ=0, yaw=-90, pitch=-30;
     bool showGrid = false;
+    GpuMemoryManager gpuMem;
+    gpuMem.Init(MAX_QUADS_BUFFER);
 
-    Profiler frameTimer;
-    double acc=0;
-    int frames=0;
-    int drawnChunks = 0; 
-    int culledChunks = 0;
-    int horizonCulled = 0;
-    unsigned int frameCounter = 0;
+    std::vector<GpuChunkInput> inputChunksData(MAX_CHUNKS);
+    bool chunksDataDirty = true;
+    bool mouseCaptured = true;
 
-    std::vector<GL::DrawElementsIndirectCommand> visibleCommands;
-    std::vector<GpuChunkInfo> visibleChunkInfos;
-    
-    struct ChunkDist { size_t index; float distSq; };
-    std::vector<ChunkDist> visibleIndices;
-    visibleIndices.reserve(estChunks);
+    GLint loc_cull_heightMap = GL::glGetUniformLocation(cullShader.id, "u_heightMap");
+    GLint loc_cull_renderDist = GL::glGetUniformLocation(cullShader.id, "u_renderDist");
+    GLint loc_cull_viewDir = GL::glGetUniformLocation(cullShader.id, "u_viewDir");
 
-    std::vector<float> horizonBuffer(HORIZON_BUCKETS);
-    
-    // Buffer Management
-    std::vector<MeshResult> pendingUpdates; // Зберігає результати, поки ми не готові оновити GPU
+    Profiler fpsTimer;
+    double acc=0; int frames=0;
+    bool initialLoadDone = false;
+    int chunksLoadedCount = 0;
 
     bool running = true;
     while(running) {
-        frameTimer.begin();
+        fpsTimer.begin();
         SDL_Event ev;
         while(SDL_PollEvent(&ev)) {
-             if(ev.type == SDL_EVENT_QUIT) running = false;
-             if(ev.type == SDL_EVENT_KEY_DOWN) {
-                 if (ev.key.key == SDLK_ESCAPE) { mouseCaptured = false; SDL_SetWindowRelativeMouseMode(window, false); }
-                 if (ev.key.key == SDLK_G) showGrid = !showGrid;
-             }
-             if(ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) { mouseCaptured = true; SDL_SetWindowRelativeMouseMode(window, true); }
-             if(ev.type == SDL_EVENT_MOUSE_MOTION && mouseCaptured) {
-                 yaw += ev.motion.xrel * 0.1f; pitch -= ev.motion.yrel * 0.1f;
-                 if(pitch > 89.0f) pitch = 89.0f; if(pitch < -89.0f) pitch = -89.0f;
-             }
+            if(ev.type == SDL_EVENT_QUIT) running = false;
+            if(ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) { mouseCaptured = !mouseCaptured; SDL_SetWindowRelativeMouseMode(window, mouseCaptured); }
+            if(ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_G) showGrid = !showGrid;
+            if(ev.type == SDL_EVENT_MOUSE_MOTION && mouseCaptured) {
+                yaw += ev.motion.xrel * 0.1f; pitch -= ev.motion.yrel * 0.1f;
+                if(pitch > 89) pitch=89; if(pitch < -89) pitch=-89;
+            }
         }
 
-        // --- Process Async Mesh Results (STORE ONLY) ---
-        MeshResult res;
-        int updatesProcessed = 0;
-        // Збираємо результати в буфер, не застосовуючи їх одразу
-        while(updatesProcessed < 50 && resultQueue.try_pop(res)) {
-            if (res.valid) {
-                pendingUpdates.push_back(std::move(res));
-            }
-            updatesProcessed++;
-        }
-
-        // Оновлюємо GPU буфер тільки раз на N кадрів або якщо накопичилось багато змін
-        bool shouldRebuild = !pendingUpdates.empty() && (frameCounter % 5 == 0 || pendingUpdates.size() > 100);
-
-        if (shouldRebuild) { 
-            // 1. Застосовуємо зміни до локальних даних (RenderChunks)
-            // Тепер ми перемикаємося зі старого LOD на новий атомарно для рендеру
-            for (auto& update : pendingUpdates) {
-                ChunkRenderDataExtended* rc = findChunk(update.cx, update.cz);
-                if (rc) {
-                    rc->gpuQuads = std::move(update.gpuQuads);
-                    rc->maxHeight = update.maxHeight;
-                    rc->currentLod = update.lod;
-                    rc->isMeshDirty = false; 
-                }
-            }
-            pendingUpdates.clear();
-
-            // 2. Перебудовуємо глобальний буфер (тільки коли застосували оновлення)
-            allGpuQuads.clear();
-            // Estimate size
-            size_t totalQuads = 0;
-            for(const auto& rc : renderChunks) totalQuads += rc.gpuQuads.size();
-            allGpuQuads.reserve(totalQuads);
-
-            for(auto& rc : renderChunks) {
-                rc.globalBufferOffset = (unsigned int)allGpuQuads.size();
-                allGpuQuads.insert(allGpuQuads.end(), rc.gpuQuads.begin(), rc.gpuQuads.end());
-            }
-
-            // 3. Завантажуємо на GPU
-            GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboQuads);
-            GL::glBufferData(GL::SHADER_STORAGE_BUFFER, allGpuQuads.size() * sizeof(GpuQuad), allGpuQuads.data(), GL_DYNAMIC_DRAW);
-        }
-
-
-        float radYaw = yaw * 0.0174533f; 
-        float radPitch = pitch * 0.0174533f;
+        float radYaw = yaw * 0.0174533f, radPitch = pitch * 0.0174533f;
         Vec3 front = Normalize({ std::cos(radYaw)*std::cos(radPitch), std::sin(radPitch), std::sin(radYaw)*std::cos(radPitch) });
         Vec3 right = Normalize(Cross(front, {0,1,0}));
-        
         const bool* keys = SDL_GetKeyboardState(nullptr);
-        float speed = 0.5f; if(keys[SDL_SCANCODE_LSHIFT]) speed = 1.5f;
-        if(keys[SDL_SCANCODE_W]) { camX += front.x*speed; camY += front.y*speed; camZ += front.z*speed; }
-        if(keys[SDL_SCANCODE_S]) { camX -= front.x*speed; camY -= front.y*speed; camZ -= front.z*speed; }
-        if(keys[SDL_SCANCODE_A]) { camX -= right.x*speed; camY -= right.y*speed; camZ -= right.z*speed; }
-        if(keys[SDL_SCANCODE_D]) { camX += right.x*speed; camY += right.y*speed; camZ += right.z*speed; }
+        float speed = keys[SDL_SCANCODE_LSHIFT] ? 2.5f : 0.8f;
+        if(keys[SDL_SCANCODE_W]) { camX+=front.x*speed; camY+=front.y*speed; camZ+=front.z*speed; }
+        if(keys[SDL_SCANCODE_S]) { camX-=front.x*speed; camY-=front.y*speed; camZ-=front.z*speed; }
+        if(keys[SDL_SCANCODE_A]) { camX-=right.x*speed; camY-=right.y*speed; camZ-=right.z*speed; }
+        if(keys[SDL_SCANCODE_D]) { camX+=right.x*speed; camY+=right.y*speed; camZ+=right.z*speed; }
 
         int w, h; SDL_GetWindowSizeInPixels(window, &w, &h);
-        float aspect = (float)w / (float)h;
         Mat4 view = LookAt({camX, camY, camZ}, {camX+front.x, camY+front.y, camZ+front.z}, {0,1,0});
-        Mat4 proj = Perspective(1.047f, aspect, 0.1f, 1000.0f); 
-        Mat4 vp = MultiplyMat4(proj, view);
-        Frustum frustum = CreateFrustum(vp);
+        Mat4 proj = Perspective(1.047f, (float)w/h, 0.1f, 40000.0f);
+        Mat4 viewProj = MultiplyMat4(proj, view);
+        Frustum frustum = CreateFrustum(viewProj);
+
+        MeshResult res;
+        int processLimit = initialLoadDone ? 50 : 500; 
+        int processed = 0;
+        bool memoryFull = false;
         
-        // --- LOD REGENERATION REQUESTS ---
-        if (frameCounter % 10 == 0) {
-            float altitudeThreshold = 100.0f; 
-            bool highAltitude = (camY > altitudeThreshold);
+        while(processed < processLimit && resultQueue.try_pop(res)) {
+            if(!res.valid) continue;
+            RenderChunk* rc = findChunk(res.cx, res.cz);
+            if(!rc) continue;
 
-            for(auto& rc : renderChunks) {
-                // Don't spam jobs if one is already pending
-                if (rc.isMeshDirty) continue;
-
-                float dx = (float)rc.chunkX * CHUNK_SIZE + 16.0f - camX;
-                float dz = (float)rc.chunkZ * CHUNK_SIZE + 16.0f - camZ;
-                float dist = std::sqrt(dx*dx + dz*dz);
-                
-                int neededLod = GetChunkLOD(dist);
-                if (highAltitude && neededLod == 1) neededLod = 2;
-                if (!highAltitude && neededLod == 2 && dist < 96.0f) neededLod = 1;
-
-                if (rc.currentLod != neededLod) {
-                    rc.isMeshDirty = true;
-                    jobQueue.push({rc.chunkX, rc.chunkZ, neededLod, 0});
+            unsigned int newOffset = 0;
+            if (gpuMem.Allocate(res.gpuQuads.size(), newOffset)) {
+                if(!res.gpuQuads.empty()) {
+                    GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboQuads);
+                    GL::glBufferSubData(GL::SHADER_STORAGE_BUFFER, newOffset * sizeof(GpuQuad), res.gpuQuads.size() * sizeof(GpuQuad), res.gpuQuads.data());
                 }
+                rc->gpuOffset = newOffset;
+                rc->gpuCount = (unsigned int)res.gpuQuads.size();
+                rc->maxHeight = res.maxHeight;
+                rc->lod = res.lod;
+                rc->inGpu = true;
+                chunksDataDirty = true;
+            } else { memoryFull = true; }
+            if (!initialLoadDone) chunksLoadedCount++;
+            processed++;
+        }
+
+        if (!initialLoadDone) {
+            if (chunksLoadedCount >= totalInitialChunks) {
+                initialLoadDone = true;
+                SDL_SetWindowTitle(window, "Voxel Game - Ready");
+            } else {
+                GL::glViewport(0,0,w,h);
+                GL::glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+                GL::glClear(GL_COLOR_BUFFER_BIT);
+                SDL_GL_SwapWindow(window);
+                continue; 
             }
         }
 
-        // --- CULLING PASS ---
-        visibleIndices.clear();
-        culledChunks = 0;
-        horizonCulled = 0;
-
-        float camDirX = std::cos(radYaw);
-        float camDirZ = std::sin(radYaw);
-        
-        float pitchFactor = std::abs(std::sin(radPitch)); 
-        float backwardShift = pitchFactor * (range * CHUNK_SIZE * 0.8f); 
-        float checkX = camX - camDirX * backwardShift;
-        float checkZ = camZ - camDirZ * backwardShift;
-
-        float fovRad = (FOV_DEG + YAW_PADDING) * 0.0174533f;
-        float minCosYaw = std::cos(fovRad / 2.0f);
-        float fovVRad = (FOV_DEG * 0.0174533f) / aspect; 
-        float minPitchAngle = radPitch - fovVRad * 0.7f;
-        float maxPitchAngle = radPitch + fovVRad * 0.7f;
-
-        for(size_t i=0; i<renderChunks.size(); ++i) {
-            auto& rc = renderChunks[i];
-            
-            // Skip rendering if mesh is not ready yet
-            if (rc.gpuQuads.empty()) continue; 
-
-            float cx = rc.chunkX * CHUNK_SIZE + CHUNK_SIZE/2.0f;
-            float cz = rc.chunkZ * CHUNK_SIZE + CHUNK_SIZE/2.0f;
-            
-            float realDx = cx - camX;
-            float realDz = cz - camZ;
-            float realDistSq = realDx*realDx + realDz*realDz;
-            float realDist = std::sqrt(realDistSq);
-
-            float checkDx = cx - checkX;
-            float checkDz = cz - checkZ;
-            float checkDist = std::sqrt(checkDx*checkDx + checkDz*checkDz);
-
-            if (realDist < (CHUNK_SIZE * 1.5f)) {
-                visibleIndices.push_back({i, realDistSq});
-                continue;
-            }
-
-            float dirX = checkDx / checkDist;
-            float dirZ = checkDz / checkDist;
-            float dot = dirX * camDirX + dirZ * camDirZ;
-
-            if (dot < minCosYaw) { culledChunks++; continue; }
-
-            float angleBottom = std::atan2(0.0f - camY, realDist);
-            float angleTop = std::atan2((float)rc.maxHeight - camY, realDist);
-            
-            if (angleTop < minPitchAngle || angleBottom > maxPitchAngle) { culledChunks++; continue; }
-
-            if (!FrustumCheckAABB(frustum, 
-                rc.chunkX * CHUNK_SIZE, 0, rc.chunkZ * CHUNK_SIZE, 
-                (rc.chunkX+1) * CHUNK_SIZE, CHUNK_SIZE, (rc.chunkZ+1) * CHUNK_SIZE)) {
-                culledChunks++; continue;
-            }
-
-            visibleIndices.push_back({i, realDistSq});
-        }
-
-        std::sort(visibleIndices.begin(), visibleIndices.end(), [](const ChunkDist& a, const ChunkDist& b) {
-            return a.distSq < b.distSq;
-        });
-
-        std::fill(horizonBuffer.begin(), horizonBuffer.end(), -100.0f); 
-        visibleCommands.clear();
-        visibleChunkInfos.clear();
-        float standardFovRad = FOV_DEG * 0.0174533f;
-
-        for (const auto& item : visibleIndices) {
-            auto& rc = renderChunks[item.index];
-            float cx = rc.chunkX * CHUNK_SIZE + CHUNK_SIZE/2.0f;
-            float cz = rc.chunkZ * CHUNK_SIZE + CHUNK_SIZE/2.0f;
-            float dx = cx - camX;
-            float dz = cz - camZ;
-            float dist = std::sqrt(item.distSq);
-            bool isNearby = (dist < (CHUNK_SIZE * 1.5f));
-            float chunkRadius = 24.0f;
-            float angularHalfWidth = std::atan2(chunkRadius, dist);
-            float angle = std::atan2(dz, dx) - radYaw;
-            angle = WrapAngle(angle);
-            float normAngleCenter = angle / (standardFovRad / 2.0f);
-            float normAngleWidth = angularHalfWidth / (standardFovRad / 2.0f);
-            
-            float u_start = (normAngleCenter - normAngleWidth + 1.0f) * 0.5f;
-            float u_end = (normAngleCenter + normAngleWidth + 1.0f) * 0.5f;
-
-            int bucketStart = (int)(u_start * HORIZON_BUCKETS);
-            int bucketEnd = (int)(u_end * HORIZON_BUCKETS);
-            
-            if (bucketStart < 0) bucketStart = 0;
-            if (bucketEnd >= HORIZON_BUCKETS) bucketEnd = HORIZON_BUCKETS - 1;
-            float relativeH = (float)rc.maxHeight - camY;
-            float tanTheta = relativeH / dist;
-            bool visible = false;
-
-            if (isNearby) { visible = true; } else {
-                if (bucketStart <= bucketEnd) {
-                    for (int b = bucketStart; b <= bucketEnd; ++b) {
-                        if (tanTheta >= horizonBuffer[b] - 0.01f) { visible = true; break; }
-                    }
-                } else { visible = true; }
-            }
-
-            if (!visible) { horizonCulled++; continue; }
-
-            if (bucketStart <= bucketEnd) {
-                for (int b = bucketStart; b <= bucketEnd; ++b) {
-                    if (tanTheta > horizonBuffer[b]) horizonBuffer[b] = tanTheta;
+        if (chunksDataDirty) {
+            int idx = 0;
+            for(const auto& rc : renderChunks) {
+                if(rc.inGpu) {
+                    int16_t sx = (int16_t)rc.cx;
+                    int16_t sz = (int16_t)rc.cz;
+                    int packed = (uint16_t)sx | ((uint16_t)sz << 16);
+                    
+                    // Calc scale based on LOD
+                    unsigned int scale = (rc.lod == 3) ? 4 : ((rc.lod == 2) ? 2 : 1);
+                    
+                    inputChunksData[idx] = {packed, rc.gpuOffset, rc.gpuCount, rc.maxHeight, scale, 0};
+                } else {
+                    inputChunksData[idx] = {0, 0, 0, 0, 1, 0};
                 }
+                int u = rc.cx + RENDER_DISTANCE;
+                int v = rc.cz + RENDER_DISTANCE;
+                if (u >= 0 && u < mapSize && v >= 0 && v < mapSize) heightMapData[v * mapSize + u] = (GLubyte)rc.maxHeight;
+                idx++;
             }
-
-            GL::DrawElementsIndirectCommand cmd;
-            cmd.count = 6; 
-            cmd.instanceCount = rc.gpuQuads.size(); 
-            cmd.firstIndex = 0;
-            cmd.baseVertex = 0;
-            cmd.baseInstance = 0; 
-            visibleCommands.push_back(cmd);
-            visibleChunkInfos.push_back({rc.chunkX * CHUNK_SIZE, rc.chunkZ * CHUNK_SIZE, rc.globalBufferOffset, 0});
+            GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboInputChunks);
+            GL::glBufferSubData(GL::SHADER_STORAGE_BUFFER, 0, MAX_CHUNKS * sizeof(GpuChunkInput), inputChunksData.data());
+            GL::glActiveTexture(GL_TEXTURE1); 
+            GL::glBindTexture(GL_TEXTURE_2D, heightMapTex);
+            GL::glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, mapSize, mapSize, GL_RED, GL_UNSIGNED_BYTE, heightMapData.data());
+            chunksDataDirty = false;
         }
         
-        drawnChunks = visibleCommands.size();
-
-        if (!visibleCommands.empty()) {
-            GL::glBindBuffer(GL::SHADER_STORAGE_BUFFER, ssboChunks);
-            GL::glBufferSubData(GL::SHADER_STORAGE_BUFFER, 0, visibleChunkInfos.size() * sizeof(GpuChunkInfo), visibleChunkInfos.data());
-            GL::glBindBuffer(GL::DRAW_INDIRECT_BUFFER, indirectBuffer);
-            GL::glBufferSubData(GL::DRAW_INDIRECT_BUFFER, 0, visibleCommands.size() * sizeof(GL::DrawElementsIndirectCommand), visibleCommands.data());
+        if (memoryFull) {
+            std::cout << "GPU Memory Full! Resetting..." << std::endl;
+            gpuMem.Reset();
+            for(auto& rc : renderChunks) { rc.inGpu = false; jobQueue.push({rc.cx, rc.cz, rc.lod}); } 
         }
+
+        GL::glUseProgram(cullShader.id);
+        GL::glUniformMatrix4fv(cullShader.loc_cull_viewProj, 1, GL_FALSE, viewProj.m);
+        GL::glUniform3f(cullShader.loc_cull_camPos, camX, camY, camZ);
+        if(loc_cull_viewDir != -1) GL::glUniform3f(loc_cull_viewDir, front.x, front.y, front.z); 
+        GL::glUniform1ui(cullShader.loc_cull_chunkCount, MAX_CHUNKS);
+        if(loc_cull_heightMap != -1) GL::glUniform1i(loc_cull_heightMap, 1); 
+        if(loc_cull_renderDist != -1) GL::glUniform1f(loc_cull_renderDist, (float)RENDER_DISTANCE);
+
+        float planesFlat[24];
+        for(int i=0;i<6;++i) {
+            planesFlat[i*4+0]=frustum.planes[i].x; planesFlat[i*4+1]=frustum.planes[i].y; 
+            planesFlat[i*4+2]=frustum.planes[i].z; planesFlat[i*4+3]=frustum.planes[i].w; 
+        }
+        if(cullShader.loc_cull_frustumPlanes != -1)
+             GL::glUniform4fv(cullShader.loc_cull_frustumPlanes, 6, planesFlat);
+
+        GLuint zero = 0;
+        GL::glBindBuffer(GL::ATOMIC_COUNTER_BUFFER, atomicCounterBuf);
+        GL::glBufferSubData(GL::ATOMIC_COUNTER_BUFFER, 0, sizeof(GLuint), &zero);
+
+        GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 1, ssboInputChunks);   
+        GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 2, ssboDrawCommands); 
+        GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 3, ssboVisibleChunks);
+        
+        GL::glActiveTexture(GL_TEXTURE1);
+        GL::glBindTexture(GL_TEXTURE_2D, heightMapTex);
+
+        GL::glDispatchCompute((MAX_CHUNKS + 63) / 64, 1, 1);
+        GL::glMemoryBarrier(0x00000040 | 0x00002000); 
 
         GL::glViewport(0,0,w,h);
-        GL::glClearColor(0.1f, 0.1f, 0.1f, 1.0f); 
+        GL::glClearColor(0.53f, 0.8f, 0.92f, 1.0f);
         GL::glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        GL::glEnable(GL_DEPTH_TEST); 
-        GL::glEnable(GL_CULL_FACE);
-        GL::glDepthMask(GL_TRUE); 
+        GL::glEnable(GL_DEPTH_TEST);
+        GL::glDisable(GL_CULL_FACE); 
 
-        GL::glUseProgram(shader.id);
-        GL::glUniformMatrix4fv(shader.loc_view, 1, GL_FALSE, view.m);
-        GL::glUniformMatrix4fv(shader.loc_proj, 1, GL_FALSE, proj.m);
-        GL::glUniform1i(shader.loc_showGrid, showGrid ? 1 : 0);
+        GL::glUseProgram(drawShader.id);
+        GL::glUniformMatrix4fv(drawShader.loc_view, 1, GL_FALSE, view.m);
+        GL::glUniformMatrix4fv(drawShader.loc_proj, 1, GL_FALSE, proj.m);
+        GL::glUniform1i(drawShader.loc_showGrid, showGrid ? 1 : 0);
+        GL::glActiveTexture(GL_TEXTURE0);
+        GL::glBindTexture(GL_TEXTURE_2D_ARRAY, texArrayID);
+        GL::glUniform1i(drawShader.loc_textureArray, 0);
 
-        GL::glBindVertexArray(emptyVAO); 
-        GL::glBindBuffer(GL::DRAW_INDIRECT_BUFFER, indirectBuffer);
-        if (drawnChunks > 0) {
-            GL::glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, (GLsizei)drawnChunks, 0);
+        GL::glBindVertexArray(emptyVAO);
+        GL::glBindBuffer(GL::DRAW_INDIRECT_BUFFER, ssboDrawCommands);
+        GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 1, ssboVisibleChunks);
+        GL::glBindBufferBase(GL::SHADER_STORAGE_BUFFER, 0, ssboQuads);
+
+        GL::glBindBuffer(GL::ATOMIC_COUNTER_BUFFER, atomicCounterBuf);
+        GLuint drawnCount = 0;
+        GL::glGetBufferSubData(GL::ATOMIC_COUNTER_BUFFER, 0, sizeof(GLuint), &drawnCount);
+
+        if(drawnCount > 0) {
+            GL::glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, drawnCount, 0);
         }
 
         SDL_GL_SwapWindow(window);
-        
-        acc += frameTimer.end();
-        frames++;
-        frameCounter++;
-        
-        if (acc >= 500.0) {
-            double fps = (frames * 1000.0) / acc;
-            std::stringstream ss;
-            ss << "Voxel Engine (MultiThreaded) | " << std::fixed << std::setprecision(1) << fps << " FPS | "
-               << "Drawn: " << drawnChunks << " | Q: " << jobQueue.empty();
-            SDL_SetWindowTitle(window, ss.str().c_str());
-            acc = 0; frames = 0;
+
+        if (initialLoadDone && frames % 30 == 0) {
+             bool highAltitude = (camY > 160.0f); 
+             for(auto& rc : renderChunks) {
+                float dist = std::sqrt(pow(rc.cx*32+16-camX,2)+pow(rc.cz*32+16-camZ,2));
+                int needed = (dist > 192) ? 3 : ((dist > 96) ? 2 : 1);
+                if (highAltitude && needed == 1) needed = 2;
+                if(rc.lod != needed) jobQueue.push({rc.cx, rc.cz, needed}); 
+             }
+        }
+
+        acc += fpsTimer.end(); frames++;
+        if(acc >= 500) {
+            std::stringstream ss; ss << "Voxel GPU | " << std::fixed << std::setprecision(1) << (frames*1000.0/acc) 
+                                     << " FPS | Chunks: " << drawnCount << "/" << MAX_CHUNKS;
+            SDL_SetWindowTitle(window, ss.str().c_str()); acc=0; frames=0;
         }
     }
-
     stopWorkers = true;
     return 0;
 }
