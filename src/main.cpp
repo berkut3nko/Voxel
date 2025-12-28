@@ -31,10 +31,12 @@ using namespace VoxelGame::RenderUtils;
 
 namespace GL = VoxelGame::GL;
 
-const int RENDER_DISTANCE = 16; 
+// --- Config ---
+const int RENDER_DISTANCE = 1; 
 const int MAX_CHUNKS = (RENDER_DISTANCE * 2 + 1) * (RENDER_DISTANCE * 2 + 1);
 const size_t MAX_QUADS_BUFFER = 16000000; 
 
+// --- GPU Structures ---
 struct GpuChunkInput {
     int packedXZ; 
     unsigned int quadStart;
@@ -73,7 +75,6 @@ void MeshWorker(WorldManager* world) {
             ctx.neighbors[1] = world->getChunk(job.cx-1, job.cz);
             ctx.neighbors[4] = world->getChunk(job.cx, job.cz+1);
             ctx.neighbors[5] = world->getChunk(job.cx, job.cz-1);
-            // FIX: Vertical neighbors are nullptr to prevent wrapping bugs
             ctx.neighbors[2] = nullptr; 
             ctx.neighbors[3] = nullptr;
 
@@ -113,20 +114,30 @@ struct GpuMemoryManager {
 };
 
 int main(int argc, char* argv[]) {
-    SDL_Init(SDL_INIT_VIDEO);
+    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11"); 
+
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
+        return -1;
+    }
+    
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     
-    SDL_Window* window = SDL_CreateWindow("Voxel Engine - Fix", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    SDL_Window* window = SDL_CreateWindow("Voxel Engine - Keyboard Support", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    if (!window) return -1;
+
     SDL_GLContext context = SDL_GL_CreateContext(window);
     SDL_GL_MakeCurrent(window, context);
     SDL_GL_SetSwapInterval(0);
     GL::LoadFunctions();
+    
+    bool mouseCaptured = true;
     SDL_SetWindowRelativeMouseMode(window, true);
     
     WorldManager world;
-    int seed = std::time(nullptr);
+    int seed = (int)std::time(nullptr);
     std::cout << "Generating " << MAX_CHUNKS << " chunks..." << std::endl;
     for (int cx = -RENDER_DISTANCE; cx <= RENDER_DISTANCE; ++cx) {
         for (int cz = -RENDER_DISTANCE; cz <= RENDER_DISTANCE; ++cz) {
@@ -152,7 +163,7 @@ int main(int argc, char* argv[]) {
     auto findChunk = [&](int cx, int cz) -> RenderChunk* {
         int r = RENDER_DISTANCE;
         int idx = (cx + r) * (2*r + 1) + (cz + r);
-        if (idx >= 0 && idx < renderChunks.size()) return &renderChunks[idx];
+        if (idx >= 0 && idx < (int)renderChunks.size()) return &renderChunks[idx];
         return nullptr;
     };
 
@@ -215,7 +226,6 @@ int main(int argc, char* argv[]) {
 
     std::vector<GpuChunkInput> inputChunksData(MAX_CHUNKS);
     bool chunksDataDirty = true;
-    bool mouseCaptured = true;
 
     GLint loc_cull_heightMap = GL::glGetUniformLocation(cullShader.id, "u_heightMap");
     GLint loc_cull_renderDist = GL::glGetUniformLocation(cullShader.id, "u_renderDist");
@@ -225,30 +235,73 @@ int main(int argc, char* argv[]) {
     double acc=0; int frames=0;
     bool initialLoadDone = false;
     int chunksLoadedCount = 0;
+    
+    bool isFullscreen = false;
+    uint32_t lastEscTime = 0;
+    const uint32_t DOUBLE_CLICK_TIME = 300; 
 
     bool running = true;
     while(running) {
         fpsTimer.begin();
         SDL_Event ev;
+        
         while(SDL_PollEvent(&ev)) {
             if(ev.type == SDL_EVENT_QUIT) running = false;
-            if(ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) { mouseCaptured = !mouseCaptured; SDL_SetWindowRelativeMouseMode(window, mouseCaptured); }
+            
+            if(ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F11) {
+                isFullscreen = !isFullscreen;
+                SDL_SetWindowFullscreen(window, isFullscreen);
+            }
+
+            if(ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) { 
+                uint32_t now = (uint32_t)SDL_GetTicks();
+                if (mouseCaptured) {
+                    mouseCaptured = false;
+                    SDL_SetWindowRelativeMouseMode(window, false);
+                } else {
+                    if (now - lastEscTime < DOUBLE_CLICK_TIME) running = false; 
+                    else lastEscTime = now;
+                }
+            }
             if(ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_G) showGrid = !showGrid;
+            
+            if(ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !mouseCaptured) {
+                mouseCaptured = true;
+                SDL_SetWindowRelativeMouseMode(window, true);
+            }
+
             if(ev.type == SDL_EVENT_MOUSE_MOTION && mouseCaptured) {
-                yaw += ev.motion.xrel * 0.1f; pitch -= ev.motion.yrel * 0.1f;
-                if(pitch > 89) pitch=89; if(pitch < -89) pitch=-89;
+                // Пряме зчитування дельти. Якщо миша впирається в край хоста, xrel/yrel стануть 0.
+                yaw += ev.motion.xrel * 0.1f; 
+                pitch -= ev.motion.yrel * 0.1f;
             }
         }
+
+        const bool* keys = SDL_GetKeyboardState(nullptr);
+        
+        // --- Альтернативне обертання клавіатурою ---
+        float rotateSpeed = 1.5f;
+        if(keys[SDL_SCANCODE_LEFT])  { yaw -= rotateSpeed; }
+        if(keys[SDL_SCANCODE_RIGHT]) { yaw += rotateSpeed; }
+        if(keys[SDL_SCANCODE_UP])    { pitch += rotateSpeed; }
+        if(keys[SDL_SCANCODE_DOWN])  { pitch -= rotateSpeed; }
+        if(pitch > 89.0f) pitch = 89.0f;
+        if(pitch < -89.0f) pitch = -89.0f;
 
         float radYaw = yaw * 0.0174533f, radPitch = pitch * 0.0174533f;
         Vec3 front = Normalize({ std::cos(radYaw)*std::cos(radPitch), std::sin(radPitch), std::sin(radYaw)*std::cos(radPitch) });
         Vec3 right = Normalize(Cross(front, {0,1,0}));
-        const bool* keys = SDL_GetKeyboardState(nullptr);
+        
+        // --- Рух ---
         float speed = keys[SDL_SCANCODE_LSHIFT] ? 2.5f : 0.8f;
         if(keys[SDL_SCANCODE_W]) { camX+=front.x*speed; camY+=front.y*speed; camZ+=front.z*speed; }
         if(keys[SDL_SCANCODE_S]) { camX-=front.x*speed; camY-=front.y*speed; camZ-=front.z*speed; }
         if(keys[SDL_SCANCODE_A]) { camX-=right.x*speed; camY-=right.y*speed; camZ-=right.z*speed; }
         if(keys[SDL_SCANCODE_D]) { camX+=right.x*speed; camY+=right.y*speed; camZ+=right.z*speed; }
+        
+        // Рух по осі Y
+        if(keys[SDL_SCANCODE_SPACE]) { camY += speed; }
+        if(keys[SDL_SCANCODE_LCTRL]) { camY -= speed; }
 
         int w, h; SDL_GetWindowSizeInPixels(window, &w, &h);
         Mat4 view = LookAt({camX, camY, camZ}, {camX+front.x, camY+front.y, camZ+front.z}, {0,1,0});
@@ -303,10 +356,7 @@ int main(int argc, char* argv[]) {
                     int16_t sx = (int16_t)rc.cx;
                     int16_t sz = (int16_t)rc.cz;
                     int packed = (uint16_t)sx | ((uint16_t)sz << 16);
-                    
-                    // Calc scale based on LOD
                     unsigned int scale = (rc.lod == 3) ? 4 : ((rc.lod == 2) ? 2 : 1);
-                    
                     inputChunksData[idx] = {packed, rc.gpuOffset, rc.gpuCount, rc.maxHeight, scale, 0};
                 } else {
                     inputChunksData[idx] = {0, 0, 0, 0, 1, 0};
@@ -384,7 +434,7 @@ int main(int argc, char* argv[]) {
         GL::glGetBufferSubData(GL::ATOMIC_COUNTER_BUFFER, 0, sizeof(GLuint), &drawnCount);
 
         if(drawnCount > 0) {
-            GL::glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, drawnCount, 0);
+            GL::glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, (GLsizei)drawnCount, 0);
         }
 
         SDL_GL_SwapWindow(window);
@@ -395,7 +445,7 @@ int main(int argc, char* argv[]) {
                 float dist = std::sqrt(pow(rc.cx*32+16-camX,2)+pow(rc.cz*32+16-camZ,2));
                 int needed = (dist > 192) ? 3 : ((dist > 96) ? 2 : 1);
                 if (highAltitude && needed == 1) needed = 2;
-                if(rc.lod != needed) jobQueue.push({rc.cx, rc.cz, needed}); 
+                if(rc.lod != (int)needed) jobQueue.push({rc.cx, rc.cz, (int)needed}); 
              }
         }
 
