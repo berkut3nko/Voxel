@@ -19,10 +19,11 @@ using namespace VoxelGame::World;
 
 export namespace VoxelGame::Meshing {
 
+    // Removed the Palette. Using raw bit packing for W/H instead.
     struct Quad {
         uint8_t x, y, z;
-        uint8_t w, h;
         uint8_t face; 
+        uint8_t w, h;
         uint8_t texLayer;
     };
 
@@ -30,16 +31,21 @@ export namespace VoxelGame::Meshing {
         uint32_t data; 
     };
 
-    uint32_t packQuad(const Quad& q) {
+    // Direct packing without palette lookup
+    uint32_t packQuad(uint8_t x, uint8_t y, uint8_t z, int face, int w, int h, uint8_t tex) {
         uint32_t d = 0;
-        d |= (q.x & 0x1F);
-        d |= (q.y & 0x1F) << 5;
-        d |= (q.z & 0x1F) << 10;
-        d |= (q.face & 0x07) << 15;
-        d |= ((q.w - 1) & 0x0F) << 18; 
-        d |= ((q.h - 1) & 0x0F) << 22; 
-        d |= (q.texLayer & 0x3F) << 26;
+        d |= (x & 0x1F);            // 0..4   (5 bits)
+        d |= (y & 0x1F) << 5;       // 5..9   (5 bits)
+        d |= (z & 0x1F) << 10;      // 10..14 (5 bits)
+        d |= (face & 0x07) << 15;   // 15..17 (3 bits)
+        d |= ((w - 1) & 0x0F) << 18; // 18..21 (4 bits, 1-16)
+        d |= ((h - 1) & 0x0F) << 22; // 22..25 (4 bits, 1-16)
+        d |= (tex & 0x3F) << 26;    // 26..31 (6 bits)
         return d;
+    }
+
+    uint32_t packQuad(const Quad& q) {
+        return packQuad(q.x, q.y, q.z, q.face, q.w, q.h, q.texLayer);
     }
 
     struct MeshingContext {
@@ -59,12 +65,12 @@ export namespace VoxelGame::Meshing {
         std::vector<BinaryQuad> quads;
         using UT = std::make_unsigned_t<T>;
         
-        for (int row = 0; row < N; ++row) {
+        for (int row = 0; row < (int)N; ++row) {
             while (data[row] != 0) {
                 int u = std::countr_zero(static_cast<UT>(data[row]));
                 int w_u = std::countr_one(static_cast<UT>(data[row] >> u));
                 
-                // Limit max width to 16 blocks (4 bits)
+                // Limit width to 16 for 4-bit packing
                 if (w_u > 16) w_u = 16;
 
                 UT h_mask_bits;
@@ -77,8 +83,9 @@ export namespace VoxelGame::Meshing {
                 UT mask = h_mask_bits << u;
                 
                 int h_v = 1; 
-                while (row + h_v < N) {
-                    if (h_v >= 16) break; // Limit max height
+                while (row + h_v < (int)N) {
+                    // Limit height to 16 for 4-bit packing
+                    if (h_v >= 16) break; 
 
                     UT next_row_bits = (static_cast<UT>(data[row + h_v]) >> u) & h_mask_bits;
                     if (next_row_bits != h_mask_bits) break;
@@ -96,7 +103,6 @@ export namespace VoxelGame::Meshing {
         if (x >= 0 && x < CHUNK_SIZE && y >= 0 && y < CHUNK_SIZE && z >= 0 && z < CHUNK_SIZE) {
             return ctx.center->get(x, y, z);
         }
-        // Check pointers before accessing neighbors!
         if (x < 0) return (ctx.neighbors[1]) ? ctx.neighbors[1]->get(CHUNK_SIZE - 1, y, z) : INTERNAL; 
         if (x >= CHUNK_SIZE) return (ctx.neighbors[0]) ? ctx.neighbors[0]->get(0, y, z) : INTERNAL;
         if (y < 0) return (ctx.neighbors[3]) ? ctx.neighbors[3]->get(x, CHUNK_SIZE - 1, z) : INTERNAL;
@@ -222,10 +228,6 @@ export namespace VoxelGame::Meshing {
                             l_pos[u_ax] = bq.u; 
                             l_pos[v_ax] = bq.v; 
                             
-                            // FIX: Зберігаємо координати в "Блоках" (Grid Units), а не метрах.
-                            // Для Side 0 (X+): грань належить блоку l_x[d]
-                            // Для Side 1 (X-): грань належить блоку l_x[d] + 1
-                            
                             if (side == 0) {
                                 l_pos[d] = l_x[d]; 
                                 q_final.face = (uint8_t)(d * 2); 
@@ -234,7 +236,6 @@ export namespace VoxelGame::Meshing {
                                 q_final.face = (uint8_t)(d * 2 + 1); 
                             }
 
-                            // Координати завжди в межах [0..N], тому влазять в 5 біт
                             q_final.x = (uint8_t)l_pos[0];
                             q_final.y = (uint8_t)l_pos[1];
                             q_final.z = (uint8_t)l_pos[2];
@@ -260,7 +261,9 @@ export namespace VoxelGame::Meshing {
     std::vector<GpuQuad> BuildSSBOData(const std::vector<Quad>& quads) {
         std::vector<GpuQuad> gpuQuads;
         gpuQuads.reserve(quads.size());
-        for (const auto& q : quads) gpuQuads.push_back({ packQuad(q) });
+        for (const auto& q : quads) {
+            gpuQuads.push_back({ packQuad(q) });
+        }
         return gpuQuads;
     }
 
