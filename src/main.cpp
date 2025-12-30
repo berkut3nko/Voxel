@@ -269,7 +269,6 @@ int main(int argc, char* argv[]) {
             if(ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_G) showGrid = !showGrid;
             if(ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !mouseCaptured) {
                 mouseCaptured = true;
-                SDL_SetWindowRelativeMouseMode(window, true);
             }
             if(ev.type == SDL_EVENT_MOUSE_MOTION && mouseCaptured) {
                 yaw += ev.motion.xrel * 0.1f; 
